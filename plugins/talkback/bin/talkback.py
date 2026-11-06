@@ -6,9 +6,9 @@ Hooks (stdin is the hook's JSON):
 Commands (from /talkback):
   talkback.py [on|off|status|full|length <n|full>|voice <name>|speed <x>|autoenter on|off|default on|off|say <text>]
 
-Stdlib only, Python 3.9+, so hooks start fast on the system python3. State lives in ~/.talkback.
+Stdlib only, Python 3.8+, runs on macOS, Linux and Windows. Hooks launch it through `uv run --no-project`,
+so no system Python is needed. State lives in ~/.talkback.
 """
-import fcntl
 import glob
 import json
 import os
@@ -17,13 +17,14 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENGINE = os.path.join(PLUGIN, "engine")
 HELPER_SRC = os.path.join(PLUGIN, "helper")
-STATE = os.environ.get("TALKBACK_HOME") or os.path.expanduser("~/.talkback")
-SOCK = os.path.join(STATE, "voiced.sock")
+STATE = os.environ.get("TALKBACK_HOME") or os.path.join(os.path.expanduser("~"), ".talkback")
+ENDPOINT = os.path.join(STATE, "voiced.json")
 CONFIG = os.path.join(STATE, "config.json")
 SESSIONS = os.path.join(STATE, "sessions")
 VENV = os.path.join(STATE, "venv")
@@ -31,6 +32,7 @@ HELPER_BIN = os.path.join(STATE, "bin", "talkback-helper")
 HELPER_PID = os.path.join(STATE, "helper.pid")
 MAX_CHARS = 700
 IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
 
 
 # ---------- config and per-session switch ----------
@@ -72,29 +74,90 @@ def is_on(session):
 # ---------- the TTS daemon ----------
 
 def send(req, timeout=2.0):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+    """One JSON request to the daemon; raises OSError if it isn't running."""
     try:
-        s.connect(SOCK)
-        s.sendall((json.dumps(req) + "\n").encode())
+        with open(ENDPOINT) as f:
+            ep = json.load(f)
+    except (OSError, ValueError):
+        raise OSError("daemon not running")
+    s = socket.create_connection(("127.0.0.1", ep["port"]), timeout=timeout)
+    try:
+        s.sendall((json.dumps(dict(req, token=ep["token"])) + "\n").encode())
         return s.makefile().readline().strip()
     finally:
         s.close()
 
 
+def engine_status():
+    try:
+        reply = send({"cmd": "ping"}, timeout=1)
+        return "running (" + reply.split()[1] + ")" if reply.startswith("pong ") else "stopped"
+    except (OSError, IndexError):
+        return "stopped"
+
+
 def daemon_alive():
     try:
-        return send({"cmd": "ping"}, timeout=1) == "pong"
+        return send({"cmd": "ping"}, timeout=1).startswith("pong")
     except OSError:
         return False
 
 
 def find_uv():
-    for cand in (shutil.which("uv"), os.path.expanduser("~/.local/bin/uv"), "/opt/homebrew/bin/uv",
-                 "/usr/local/bin/uv", os.path.expanduser("~/.cargo/bin/uv")):
+    home = os.path.expanduser("~")
+    exe = "uv.exe" if IS_WIN else "uv"
+    for cand in (shutil.which("uv"), os.path.join(home, ".local", "bin", exe), "/opt/homebrew/bin/uv",
+                 "/usr/local/bin/uv", os.path.join(home, ".cargo", "bin", exe)):
         if cand and os.path.exists(cand):
             return cand
     return None
+
+
+def spawn_detached(argv, log_path=None, env=None, cwd=None):
+    """Start a process that outlives this one (and the hook that started it)."""
+    out = open(log_path, "a") if log_path else subprocess.DEVNULL
+    try:
+        if not IS_WIN:
+            return subprocess.Popen(argv, stdout=out, stderr=out, stdin=subprocess.DEVNULL, env=env, cwd=cwd,
+                                    start_new_session=True)
+        # CREATE_NO_WINDOW (not DETACHED_PROCESS) gives a hidden console that uv's python child inherits, so no
+        # window pops up. Break away from Claude Code's job object so the daemon survives the session; fall back
+        # if the job doesn't allow it.
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        try:
+            return subprocess.Popen(argv, stdout=out, stderr=out, stdin=subprocess.DEVNULL, env=env, cwd=cwd,
+                                    creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB)
+        except OSError:
+            return subprocess.Popen(argv, stdout=out, stderr=out, stdin=subprocess.DEVNULL, env=env, cwd=cwd,
+                                    creationflags=flags)
+    finally:
+        if log_path:
+            out.close()
+
+
+class FileLock:
+    """Exclusive lock on a file, on POSIX and Windows."""
+
+    def __init__(self, path):
+        self.f = open(path, "a+")
+
+    def __enter__(self):
+        if IS_WIN:
+            import msvcrt
+            while True:
+                try:
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:  # LK_LOCK gives up after ~10 s; keep waiting
+                    continue
+        else:
+            import fcntl
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()  # closing releases the lock on both
 
 
 def ensure_daemon(wait=900):
@@ -105,16 +168,12 @@ def ensure_daemon(wait=900):
     if not uv:
         return False
     os.makedirs(STATE, exist_ok=True)
-    with open(os.path.join(STATE, "daemon.lock"), "w") as lockf:
-        fcntl.flock(lockf, fcntl.LOCK_EX)  # one starter at a time; others wait here and then find it alive
+    with FileLock(os.path.join(STATE, "daemon.lock")):  # one starter at a time; the rest then find it alive
         if daemon_alive():
             return True
-        env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE)
-        with open(os.path.join(STATE, "voiced.log"), "a") as log:
-            proc = subprocess.Popen([uv, "run", "--project", ENGINE, "--frozen", "python",
-                                     os.path.join(ENGINE, "voiced.py")],
-                                    stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env,
-                                    cwd=STATE, start_new_session=True)
+        env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE, PYTHONUNBUFFERED="1")
+        proc = spawn_detached([uv, "run", "--project", ENGINE, "--frozen", "python", os.path.join(ENGINE, "voiced.py")],
+                              log_path=os.path.join(STATE, "voiced.log"), env=env, cwd=STATE)
         deadline = time.time() + wait
         while time.time() < deadline:
             if proc.poll() is not None:
@@ -127,15 +186,16 @@ def ensure_daemon(wait=900):
 
 def say_detached(text, session):
     """Hand off to a background child so a hook returns at once, even on a cold start."""
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_say", session or "", text],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    # Text goes through a file: Windows caps a command line at 32k characters.
+    os.makedirs(STATE, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="say-", suffix=".txt", dir=STATE)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    spawn_detached([sys.executable, os.path.abspath(__file__), "_say", session or "", path])
 
 
 def warm_detached():
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_warm"],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    spawn_detached([sys.executable, os.path.abspath(__file__), "_warm"])
 
 
 # ---------- the macOS helper (mic-stop + auto-Enter) ----------
@@ -180,9 +240,8 @@ def build_helper():
 def ensure_helper():
     if not IS_MAC or helper_running() or not build_helper():
         return
-    with open(os.path.join(STATE, "helper.log"), "a") as log:
-        proc = subprocess.Popen([HELPER_BIN], stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-                                env=dict(os.environ, TALKBACK_HOME=STATE), start_new_session=True)
+    proc = spawn_detached([HELPER_BIN], log_path=os.path.join(STATE, "helper.log"),
+                          env=dict(os.environ, TALKBACK_HOME=STATE))
     with open(HELPER_PID, "w") as f:
         f.write(str(proc.pid))
 
@@ -190,14 +249,14 @@ def ensure_helper():
 # ---------- turning a reply into speech ----------
 
 def find_transcript(session):
-    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session}.jsonl"))
+    hits = glob.glob(os.path.join(os.path.expanduser("~"), ".claude", "projects", "*", session + ".jsonl"))
     return hits[0] if hits else ""
 
 
 def last_reply(transcript_path):
     """Text of the last assistant message that has any text in it."""
     try:
-        with open(transcript_path) as f:
+        with open(transcript_path, encoding="utf-8") as f:
             lines = f.readlines()
     except OSError:
         return ""
@@ -247,7 +306,7 @@ def speakable(md, limit=MAX_CHARS):
 # ---------- hooks ----------
 
 def hook(event):
-    data = json.load(sys.stdin)
+    data = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
     session = data.get("session_id", "")
     if event == "stop":
         if not is_on(session):
@@ -283,13 +342,13 @@ def command(args):
     cmd = args[0] if args else ("off" if is_on(session) else "on")
     if cmd == "on":
         if not find_uv():
-            print("talkback needs uv to install Kokoro: brew install uv  (or: curl -LsSf https://astral.sh/uv/install.sh | sh)")
+            print("talkback needs uv: https://docs.astral.sh/uv/getting-started/installation/")
             return
         set_session(session, "on")
         first = not os.path.isdir(VENV)
         warm_detached()
         print("Talkback is on for this session."
-              + (" First-time setup is installing Kokoro (about 600 MB) in the background;"
+              + (" First-time setup is installing Kokoro in the background (a few hundred MB);"
                  " replies start speaking in a minute or two." if first else ""))
     elif cmd == "off":
         set_session(session, "off")
@@ -332,8 +391,8 @@ def command(args):
               f"length={cfg.get('max_chars', MAX_CHARS) or 'full'}, "
               f"autoenter={'on' if cfg.get('autoenter', True) else 'off'}, "
               f"default={'on' if cfg.get('default_on') else 'off'}, "
-              f"engine={'running' if daemon_alive() else 'stopped'}, "
-              f"helper={'running' if helper_running() else 'stopped'}.")
+              f"engine={engine_status()}"
+              + (f", helper={'running' if helper_running() else 'stopped'}" if IS_MAC else "") + ".")
 
 
 def main():
@@ -344,9 +403,12 @@ def main():
         ensure_helper()
         ensure_daemon()
     elif argv[:1] == ["_say"]:
+        with open(argv[2], encoding="utf-8") as f:
+            text = f.read()
+        os.unlink(argv[2])
         ensure_helper()
         if ensure_daemon():
-            send({"cmd": "say", "session": argv[1] or None, "text": argv[2]}, timeout=30)
+            send({"cmd": "say", "session": argv[1] or None, "text": text}, timeout=30)
     elif argv[:1] == ["speak"]:
         # Pipe-friendly: `some command | talkback.py speak`
         text = speakable(" ".join(argv[1:]) or sys.stdin.read(), limit=0)
