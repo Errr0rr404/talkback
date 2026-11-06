@@ -14,7 +14,7 @@ let home = FileManager.default.homeDirectoryForCurrentUser.path
 let state = ProcessInfo.processInfo.environment["TALKBACK_HOME"] ?? home + "/.talkback"
 let historyPath = home + "/Library/Application Support/hex/history.json"
 let configPath = state + "/config.json"
-let voiceSock = state + "/voiced.sock"
+let endpointPath = state + "/voiced.json"
 let ttyScripts = [
     "com.apple.Terminal": "tell application \"Terminal\" to get tty of selected tab of front window",
     "com.googlecode.iterm2": "tell application \"iTerm2\" to get tty of current session of current window",
@@ -53,19 +53,22 @@ func micInUse() -> Bool {
 }
 
 func stopSpeech() {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    // The daemon listens on 127.0.0.1; its port and token are in voiced.json.
+    guard let data = FileManager.default.contents(atPath: endpointPath),
+          let ep = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let port = ep["port"] as? Int, let token = ep["token"] as? String else { return }
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
     guard fd >= 0 else { return }
     defer { close(fd) }
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    withUnsafeMutableBytes(of: &addr.sun_path) { buf in
-        voiceSock.utf8CString.withUnsafeBytes { buf.copyMemory(from: UnsafeRawBufferPointer(rebasing: $0.prefix(buf.count))) }
-    }
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = in_port_t(UInt16(port).bigEndian)
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
     let ok = withUnsafePointer(to: &addr) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
     }
     guard ok == 0 else { return }  // daemon not running: nothing to stop
-    let msg = "{\"cmd\": \"stop\"}\n"
+    let msg = "{\"cmd\": \"stop\", \"token\": \"\(token)\"}\n"
     _ = msg.withCString { write(fd, $0, strlen($0)) }
 }
 
