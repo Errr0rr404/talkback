@@ -1,0 +1,15 @@
+{
+  "name": "talkback",
+  "owner": {
+    "name": "Samian",
+    "url": "https://github.com/Errr0rr404"
+  },
+  "plugins": [
+    {
+      "name": "talkback",
+      "source": "./plugins/talkback",
+      "description": "Hear Claude Code's replies in a local Kokoro voice; talk back with Hex, with auto-Enter and press-to-interrupt."
+    }
+  ],
+  "description": "talkback: hear Claude Code's replies in a local Kokoro voice and talk back with Hex."
+}
