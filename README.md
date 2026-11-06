@@ -29,7 +29,7 @@ The first time, Kokoro downloads in the background (a few hundred MB, a minute o
 talkback does the listening part. To talk, use either:
 
 - **Claude Code's `/voice`** (built in, needs a claude.ai login). Run `/voice tap`, then tap Space, speak, tap Space: your message sends itself.
-- **[Hex](https://github.com/anomalyco/hex)** if you want your voice to stay on your machine. On macOS, talkback presses Enter for you when you release Hex's hotkey (Terminal and iTerm2).
+- **[Hex](https://github.com/anomalyco/hex)** if you use Claude Code through Amazon Bedrock, Google Cloud, Microsoft Foundry, an API key or a company gateway (`/voice` doesn't work there), or if you want your voice to stay on your machine. On macOS, talkback presses Enter for you when you release Hex's hotkey (Terminal and iTerm2).
 
 ## Commands
 
