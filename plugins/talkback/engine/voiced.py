@@ -1,8 +1,9 @@
 """Kokoro TTS daemon: keeps the model warm and speaks text it is sent.
 
 Listens on 127.0.0.1 (port and token in ~/.talkback/voiced.json). Requests are one JSON line with the token:
-{"cmd": "say", "text": ..., "session": ...}, {"cmd": "stop", "session": ...} or {"cmd": "ping"}.
-A new "say" interrupts whatever is playing; a "stop" without a session stops any speech.
+{"cmd": "say", "text": ..., "session": ...}, {"cmd": "stop", "session": ...}, {"cmd": "ping"} or {"cmd": "quit"}.
+A new "say" interrupts whatever is playing; a "stop" without a session stops any speech. "ping" answers
+"pong <engine> <version>" so the plugin can replace a daemon left over from an older version.
 
 Engines: MLX on Apple silicon (GPU), Kokoro ONNX on the CPU everywhere else (Linux, Windows, Intel Macs).
 On Linux and Windows the daemon also stops speech when a microphone turns on (macOS: talkback-helper).
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.request
 
 import numpy as np
@@ -28,6 +30,7 @@ import soundfile as sf
 STATE = os.environ.get("TALKBACK_HOME") or os.path.join(os.path.expanduser("~"), ".talkback")
 ENDPOINT = os.path.join(STATE, "voiced.json")
 CONFIG = os.path.join(STATE, "config.json")
+VERSION = os.environ.get("TALKBACK_VERSION", "dev")
 IDLE_EXIT = 60 * 60
 SAMPLE_RATE = 24000
 ONNX_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
@@ -47,8 +50,9 @@ class MlxEngine:
         self.model = load_model("mlx-community/Kokoro-82M-bf16")
 
     def generate(self, text, voice, speed):
-        # Kokoro's pipeline yields one segment per sentence group.
-        for seg in self.model.generate(text=text, voice=voice, speed=speed, lang_code="a"):
+        # Kokoro's pipeline yields one segment per sentence group. The voice's first letter is its language
+        # ("a" American, "b" British English).
+        for seg in self.model.generate(text=text, voice=voice, speed=speed, lang_code=voice[:1] or "a"):
             yield np.array(seg.audio)
 
 
@@ -71,7 +75,8 @@ class OnnxEngine:
     def generate(self, text, voice, speed):
         # Speak sentence groups one at a time so playback starts before the whole reply is synthesized.
         for chunk in sentence_chunks(text):
-            samples, _ = self.kokoro.create(chunk, voice=voice, speed=speed, lang="en-us")
+            samples, _ = self.kokoro.create(chunk, voice=voice, speed=speed,
+                                            lang="en-gb" if voice.startswith("b") else "en-us")
             yield samples
 
 
@@ -213,6 +218,7 @@ def mic_probe():
 engine = load_engine()
 make_player = player_factory()
 lock = threading.Lock()
+speak_lock = threading.Lock()  # one synthesis at a time: a new reply waits for the old one to notice it was stopped
 current = {"gen": 0, "session": None, "player": None}
 last_used = time.time()
 token = secrets.token_hex(16)
@@ -241,6 +247,12 @@ def speak(text, session):
     with lock:
         gen = current["gen"]
         current["session"] = session
+    with speak_lock:
+        if gen == current["gen"]:  # not stopped or replaced while waiting for the previous reply to wind down
+            speak_locked(text, gen)
+
+
+def speak_locked(text, gen):
     cfg = config()
     tmpdir = tempfile.mkdtemp(prefix="talkback-")
     try:
@@ -258,7 +270,8 @@ def speak(text, session):
                 player = current["player"] = make_player(path, len(audio) / SAMPLE_RATE)
         if player:
             player.wait()
-        log(f"spoke {len(text)} chars")
+        if gen == current["gen"]:
+            log(f"spoke {len(text)} chars")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
         with lock:
@@ -279,12 +292,19 @@ def handle(conn):
         cmd = req.get("cmd")
         if cmd == "say" and req.get("text", "").strip():
             conn.sendall(b"ok\n")
-            speak(req["text"], req.get("session"))
+            try:
+                speak(req["text"], req.get("session"))
+            except Exception:
+                log("speaking failed:\n" + traceback.format_exc())
         elif cmd == "stop":
             stop(req.get("session"))
             conn.sendall(b"ok\n")
         elif cmd == "ping":
-            conn.sendall(f"pong {engine.name}\n".encode())
+            conn.sendall(f"pong {engine.name} {VERSION}\n".encode())
+        elif cmd == "quit":
+            stop()
+            conn.sendall(b"ok\n")
+            shutdown()
 
 
 def mic_watch(probe):
@@ -301,15 +321,22 @@ def mic_watch(probe):
         was_on = on
 
 
+def shutdown():
+    try:
+        with open(ENDPOINT) as f:
+            mine = json.load(f).get("pid") == os.getpid()
+        if mine:
+            os.unlink(ENDPOINT)
+    except (OSError, ValueError):
+        pass
+    os._exit(0)
+
+
 def idle_watch():
     while True:
         time.sleep(60)
         if time.time() - last_used > IDLE_EXIT and current["player"] is None:
-            try:
-                os.unlink(ENDPOINT)
-            except OSError:
-                pass
-            os._exit(0)
+            shutdown()
 
 
 def main():
@@ -326,7 +353,7 @@ def main():
     if os.name == "posix":
         os.chmod(tmp, 0o600)
     os.replace(tmp, ENDPOINT)
-    log(f"ready: engine={engine.name} port={srv.getsockname()[1]}")
+    log(f"ready: engine={engine.name} version={VERSION} port={srv.getsockname()[1]}")
     probe = mic_probe()
     if probe:
         threading.Thread(target=mic_watch, args=(probe,), daemon=True).start()
