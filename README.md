@@ -1,12 +1,12 @@
 # talkback
 
-Talk to Claude Code and hear it answer, all on your own machine. Works on macOS, Linux and Windows.
+Talk to Claude Code and hear it answer in a natural voice that runs on your own machine. Works on macOS, Linux and Windows.
 
 - **Hear replies** in a natural voice from [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), running locally (on the GPU through MLX on Apple silicon, on the CPU with ONNX everywhere else). Code blocks, tables and long paths are skipped, and long replies are trimmed (or read in full if you prefer).
-- **Talk back** with [Hex](https://github.com/anomalyco/hex) (or any dictation tool): hold the hotkey, speak, let go. On macOS, talkback presses Return for you after a Hex dictation, so the message sends itself.
-- **Interrupt** by pressing your dictation hotkey (or sending any message): speech stops the moment a mic turns on.
+- **Talk back** with Claude Code's built-in `/voice` dictation, or with [Hex](https://github.com/anomalyco/hex) if you want it fully local (see [How you talk](#how-you-talk)). The message can send itself when you finish speaking: with `/voice` everywhere, with Hex on macOS.
+- **Interrupt** by starting to talk (or sending any message): speech stops the moment a mic turns on.
 
-Nothing leaves your machine: Hex and Kokoro both run locally.
+The voice you hear always runs on your machine. What you say stays on your machine too if you dictate with Hex.
 
 ## Install
 
@@ -25,6 +25,20 @@ Then, in a Claude Code session:
 
 The first time, talkback installs Kokoro in the background into `~/.talkback` (a few hundred MB: the Python environment plus the voice model), which takes a minute or two. You'll hear replies once it's ready. `/talkback` with no argument toggles it.
 
+### How you talk
+
+talkback is the "hear" half. For the "talk" half, pick one:
+
+| | Claude Code `/voice` | Hex | Your OS's dictation |
+|---|---|---|---|
+| Platforms | macOS, Linux, Windows | macOS, Linux, Windows | macOS (Dictation), Windows (Win+H) |
+| Transcription | Anthropic's servers | on your machine | depends on the OS |
+| Needs | a claude.ai login | the [Hex app](https://github.com/anomalyco/hex) | nothing extra |
+| Sends by itself | yes: `/voice tap` (tap Space, speak, tap again), or hold mode with `"voice": {"autoSubmit": true}` in settings | on macOS, talkback presses Return after a Hex dictation; elsewhere press Enter | no, press Enter |
+| Stops the voice when you start talking | yes | yes | yes |
+
+The simplest setup is `/voice tap` plus `/talkback on`: tap Space, talk, tap Space, and listen. See Claude Code's [voice dictation docs](https://code.claude.com/docs/en/voice-dictation) for details. Choose Hex if you don't want your audio to leave your machine.
+
 ### Requirements
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) on your `PATH`. talkback's hooks run through `uv`, which also supplies Python, so you don't need Python installed.
@@ -32,7 +46,7 @@ The first time, talkback installs Kokoro in the background into `~/.talkback` (a
   - Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
   - Windows: `winget install astral-sh.uv` (or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`)
 - Linux: an audio player, any one of `pw-play` (PipeWire), `paplay` (PulseAudio), `aplay` (ALSA) or `ffplay`. Most desktops have one already.
-- Optional: [Hex](https://github.com/anomalyco/hex) for voice input (`brew install --cask anomalyco/tap/hex` on macOS; installers for Windows and Linux on its releases page). Without it you still hear replies.
+- A way to talk (see [How you talk](#how-you-talk)): Claude Code's `/voice` needs nothing extra beyond a claude.ai login; Hex installs with `brew install --cask anomalyco/tap/hex` on macOS, or from its releases page on Windows and Linux.
 
 ### What works where
 
@@ -40,7 +54,7 @@ The first time, talkback installs Kokoro in the background into `~/.talkback` (a
 |---|---|---|---|---|
 | Spoken replies | MLX on the GPU | ONNX on the CPU | ONNX on the CPU | ONNX on the CPU |
 | Stop speaking when you send a message | yes | yes | yes | yes |
-| Stop speaking when the mic turns on (Hex hotkey) | yes | yes (needs Xcode tools to build the helper) | yes, with PulseAudio or PipeWire (`pactl`) | yes |
+| Stop speaking when the mic turns on (you start dictating) | yes | yes (needs Xcode tools to build the helper) | yes, with PulseAudio or PipeWire (`pactl`) | yes |
 | Auto-Enter after Hex dictation | Terminal, iTerm2 | Terminal, iTerm2 | not yet | not yet |
 
 Auto-Enter needs Accessibility permission for your terminal app (System Settings, Privacy & Security, Accessibility); macOS asks the first time. It presses Return only when Claude Code is the foreground program of the front tab, so dictated words never run as a shell command, even if Claude is suspended in the background of that tab. Once the helper is running it applies to every Claude Code tab, whether or not talkback is on there; turn it off with `/talkback autoenter off`. On Linux and Windows there is no reliable way yet to tell which terminal tab has focus, so auto-Enter is off there: press Enter yourself.
