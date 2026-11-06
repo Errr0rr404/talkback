@@ -1,132 +1,67 @@
 # talkback
 
-Talk to Claude Code and hear it answer in a natural voice that runs on your own machine. Works on macOS, Linux and Windows.
+Hear Claude Code read its replies aloud, in a natural voice ([Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)) that runs on your own machine. macOS, Linux and Windows.
 
-- **Hear replies** in a natural voice from [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), running locally (on the GPU through MLX on Apple silicon, on the CPU with ONNX everywhere else). Code blocks, tables and long paths are skipped, and long replies are trimmed (or read in full if you prefer).
-- **Talk back** with Claude Code's built-in `/voice` dictation, or with [Hex](https://github.com/anomalyco/hex) if you want it fully local (see [How you talk](#how-you-talk)). The message can send itself when you finish speaking: with `/voice` everywhere, with Hex on macOS.
-- **Interrupt** by starting to talk (or sending any message): speech stops the moment a mic turns on.
-
-The voice you hear always runs on your machine. What you say stays on your machine too if you dictate with Hex.
+- Code, tables and long paths are skipped; long replies are trimmed.
+- Speech stops as soon as you start talking or send a message.
 
 ## Install
+
+You need [uv](https://docs.astral.sh/uv/getting-started/installation/) (`brew install uv`, or `winget install astral-sh.uv` on Windows). talkback uses it to install everything else, Kokoro included.
 
 ```sh
 claude plugin marketplace add Errr0rr404/talkback
 claude plugin install talkback@talkback
 ```
 
-Then, in a Claude Code session:
+Then in Claude Code:
 
 ```
 /talkback on
 ```
 
-If Claude Code says `Unknown command` or `Unknown skill: talkback`, use the command's full name:
+If that says *Unknown command* or *Unknown skill*, use the full name: `/talkback:talkback on`. (Still unknown? Run `/reload-plugins`.)
 
-```
-/talkback:talkback on
-```
+The first time, Kokoro downloads in the background (a few hundred MB, a minute or two). `/talkback status` shows `installing Kokoro` until it's ready.
 
-Plugin commands are named `plugin:command`. Whether the short `/talkback` also works depends on your Claude Code version, and headless `claude -p` sessions only accept the full name. Every `/talkback ...` command in this README works the same as `/talkback:talkback ...`. If neither name is found right after installing, run `/reload-plugins` or start a new session.
+## Talking to Claude
 
-You don't install Kokoro yourself. The first time, talkback installs it in the background into `~/.talkback`: uv downloads the Python libraries, then talkback downloads the Kokoro voice model (from Hugging Face on Apple silicon, from GitHub elsewhere). That's a few hundred MB and takes a minute or two. Meanwhile `/talkback status` shows `engine=installing Kokoro`, and a reply that finishes before then shows a note saying it will be spoken once Kokoro is ready. `/talkback` with no argument toggles it.
+talkback does the listening part. To talk, use either:
 
-### How you talk
-
-talkback is the "hear" half. For the "talk" half, pick one:
-
-| | Claude Code `/voice` | Hex | Your OS's dictation |
-|---|---|---|---|
-| Platforms | macOS, Linux, Windows | macOS, Linux, Windows | macOS (Dictation), Windows (Win+H) |
-| Transcription | Anthropic's servers | on your machine | depends on the OS |
-| Needs | a claude.ai login | the [Hex app](https://github.com/anomalyco/hex) | nothing extra |
-| Sends by itself | yes: `/voice tap` (tap Space, speak, tap again), or hold mode with `"voice": {"autoSubmit": true}` in settings | on macOS, talkback presses Return after a Hex dictation; elsewhere press Enter | no, press Enter |
-| Stops the voice when you start talking | yes | yes | yes |
-
-The simplest setup is `/voice tap` plus `/talkback on`: tap Space, talk, tap Space, and listen. See Claude Code's [voice dictation docs](https://code.claude.com/docs/en/voice-dictation) for details. Choose Hex if you don't want your audio to leave your machine.
-
-### Requirements
-
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) on your `PATH`. This is the only thing you install by hand: talkback uses uv to fetch Python, Kokoro and the voice model on first use, so you don't install Python or Kokoro yourself.
-  - macOS: `brew install uv`
-  - Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
-  - Windows: `winget install astral-sh.uv` (or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`)
-- Linux: an audio player, any one of `pw-play` (PipeWire), `paplay` (PulseAudio), `aplay` (ALSA) or `ffplay`. Most desktops have one already.
-- A way to talk (see [How you talk](#how-you-talk)): Claude Code's `/voice` needs nothing extra beyond a claude.ai login; Hex installs with `brew install --cask anomalyco/tap/hex` on macOS, or from its releases page on Windows and Linux.
-
-### What works where
-
-| | macOS (Apple silicon) | macOS (Intel) | Linux | Windows |
-|---|---|---|---|---|
-| Spoken replies | MLX on the GPU | ONNX on the CPU | ONNX on the CPU | ONNX on the CPU |
-| Stop speaking when you send a message | yes | yes | yes | yes |
-| Stop speaking when the mic turns on (you start dictating) | yes | yes (needs Xcode tools to build the helper) | yes, with PulseAudio or PipeWire (`pactl`) | yes |
-| Auto-Enter after Hex dictation | Terminal, iTerm2 | Terminal, iTerm2 | not yet | not yet |
-
-Auto-Enter needs Accessibility permission for your terminal app (System Settings, Privacy & Security, Accessibility); macOS asks the first time. It presses Return only when Claude Code is the foreground program of the front tab, so dictated words never run as a shell command, even if Claude is suspended in the background of that tab. Once the helper is running it applies to every Claude Code tab, whether or not talkback is on there; turn it off with `/talkback autoenter off`. On Linux and Windows there is no reliable way yet to tell which terminal tab has focus, so auto-Enter is off there: press Enter yourself.
+- **Claude Code's `/voice`** (built in, needs a claude.ai login). Run `/voice tap`, then tap Space, speak, tap Space: your message sends itself.
+- **[Hex](https://github.com/anomalyco/hex)** if you want your voice to stay on your machine. On macOS, talkback presses Enter for you when you release Hex's hotkey (Terminal and iTerm2).
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/talkback on` / `off` | Spoken replies for this session (off by default, so other sessions stay quiet) |
-| `/talkback status` | Current settings and whether the engine and helper are running |
+| `/talkback on` / `off` | Turn spoken replies on or off for this session |
+| `/talkback status` | Show settings and whether the voice is ready |
 | `/talkback full` | Read the last reply again, in full |
-| `/talkback length full` / `length 700` | Read every reply in full, or up to N characters |
-| `/talkback voice bf_emma` | Pick an English [Kokoro voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md): `af_*`/`am_*` American, `bf_*`/`bm_*` British (default `af_heart`) |
-| `/talkback speed 1.3` | Speaking speed from 0.5 to 2 (default 1.1) |
-| `/talkback autoenter off` | Stop pressing Return after Hex dictation |
-| `/talkback default on` | Turn talkback on in every new session |
-| `/talkback say <text>` | Speak any text |
-
-From a shell: `npm test 2>&1 | tail -3 | uv run --no-project python <plugin>/bin/talkback.py speak`.
-
-## How it works
-
-- A `Stop` hook takes Claude's last reply, turns the Markdown into plain sentences and sends it to a small Kokoro service on `127.0.0.1` that stays loaded (on Apple silicon about 0.6 s to make 10 s of speech; it quits after an hour unused).
-- A `UserPromptSubmit` hook stops speech when you send a message. A `SessionStart` hook warms the engine for sessions where talkback is on.
-- After a plugin update, the next reply replaces a speech service or helper left over from the older version.
-- On Linux and Windows the service itself stops speech when a microphone turns on (via `pactl` on Linux, Windows' microphone privacy records on Windows).
-- On macOS, a tiny native helper (`helper/main.swift`, built on first use) does two things:
-  - It watches for any microphone turning on, which is what happens when you press Hex's hotkey, and stops speech.
-  - It watches Hex's history. After a dictation lands in Terminal or iTerm2, it presses Return, but only if Claude Code is in the foreground of the front tab.
-  - Only one copy runs at a time.
-
-State, logs and settings live in `~/.talkback/` (`voiced.log`, `helper.log`, `config.json`, and one small on/off file per session in `sessions/`, pruned after two weeks unused). Replies are read from the hook input on your machine; nothing is sent anywhere.
+| `/talkback length full` | Always read whole replies (`length 700` to trim again) |
+| `/talkback voice bf_emma` | Change the [voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md) (default `af_heart`) |
+| `/talkback speed 1.3` | Speaking speed, 0.5 to 2 |
+| `/talkback default on` | Turn it on in every new session |
+| `/talkback autoenter off` | Stop pressing Enter after Hex |
+| `/talkback say hello` | Speak any text |
 
 ## Troubleshooting
 
-- **Nothing is spoken:** run `/talkback status`. `installing Kokoro` means the first-time download is still running; wait for it. `stopped (the last start failed ...)` or a plain `stopped` that doesn't change: look at `~/.talkback/voiced.log`. If it says `running` but you hear nothing, check your sound output device and volume, and try `/talkback say hello`.
-- **Hook errors mentioning `uv`:** uv isn't on the `PATH` that Claude Code sees. Install it and restart Claude Code.
-- **Linux is silent:** `voiced.log` says `no audio player found`; install `pipewire`, `pulseaudio-utils`, `alsa-utils` or `ffmpeg`.
-- **Auto-Enter doesn't press Return (macOS):** check `~/.talkback/helper.log`. `accessibility trusted=false` means your terminal app needs Accessibility permission; "front tab is not running claude" means the focused tab wasn't Claude Code.
+- **No sound:** run `/talkback status`. If it says `installing Kokoro`, wait. If it says `stopped`, see `~/.talkback/voiced.log`. If it says `running`, check your volume and try `/talkback say hello`.
+- **Errors about `uv`:** install uv, then restart Claude Code.
+- **Linux, no sound:** install an audio player (`pipewire`, `pulseaudio-utils` or `alsa-utils`).
+- **macOS, Enter isn't pressed after Hex:** give your terminal Accessibility permission (System Settings, Privacy & Security, Accessibility).
 
 ## Uninstall
 
 ```sh
 claude plugin uninstall talkback@talkback
-```
-
-Then stop the background processes and delete `~/.talkback`. On macOS and Linux:
-
-```sh
-kill $(cut -d' ' -f1 ~/.talkback/helper.pid) 2>/dev/null   # macOS helper
-kill $(python3 -c "import json;print(json.load(open('$HOME/.talkback/voiced.json'))['pid'])") 2>/dev/null
+pkill -x talkback-helper   # macOS only
 rm -rf ~/.talkback
 ```
 
-On Windows, the speech service quits on its own within an hour; then delete `%USERPROFILE%\.talkback`.
+The background voice service quits by itself within an hour.
 
-## Development
+---
 
-```sh
-git clone https://github.com/Errr0rr404/talkback && cd talkback
-uv run --no-project python -m unittest discover -s tests     # text cleanup, commands and hooks
-claude plugin marketplace add "$PWD" && claude plugin install talkback@talkback
-```
-
-The plugin lives in `plugins/talkback/`: `bin/talkback.py` (hooks and the command; standard library only, Python 3.8+), `engine/voiced.py` (the speech service, run with `uv` from `engine/pyproject.toml`), and `helper/main.swift` (the macOS helper; `helper/build.sh` builds it, and `talkback-helper-arm64` is a prebuilt copy for Macs without Xcode tools). After changing the plugin, bump `version` in `plugins/talkback/.claude-plugin/plugin.json` and run `claude plugin update talkback@talkback`.
-
-## Licenses
-
-talkback is MIT. Kokoro-82M weights are Apache 2.0. Hex is MIT. Python dependencies are installed from PyPI at setup time under their own licenses (espeak-ng, used for rare-word pronunciation, is GPL-3.0).
+[How it works](docs/how-it-works.md) · MIT license · Kokoro-82M is Apache 2.0, Hex is MIT
