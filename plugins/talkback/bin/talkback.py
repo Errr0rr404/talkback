@@ -2,7 +2,7 @@
 """talkback: hear Claude Code's replies (Kokoro-82M), talk back with Hex, and auto-Enter.
 
 Hooks (stdin is the hook's JSON):
-  talkback.py hook stop | prompt | session-start | session-end
+  talkback.py hook stop | prompt | session-start
 Commands (from /talkback):
   talkback.py [on|off|status|full|length <n|full>|voice <name>|speed <x>|autoenter on|off|default on|off|say <text>]
 
@@ -31,6 +31,15 @@ VENV = os.path.join(STATE, "venv")
 HELPER_BIN = os.path.join(STATE, "bin", "talkback-helper")
 HELPER_PID = os.path.join(STATE, "helper.pid")
 MAX_CHARS = 700
+SESSION_TTL = 14 * 24 * 3600  # on/off switches of sessions untouched this long are pruned
+VOICES = {  # Kokoro v1.0 English voices: first letter a = American, b = British
+    "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore", "af_nicole", "af_nova", "af_river",
+    "af_sarah", "af_sky", "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael", "am_onyx",
+    "am_puck", "am_santa", "bf_alice", "bf_emma", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable",
+    "bm_george", "bm_lewis",
+}
+USAGE = ("Usage: /talkback [on|off|status|full|length <n|full>|voice <name>|speed <0.5-2>|"
+         "autoenter on|off|default on|off|say <text>]")
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform == "win32"
 
@@ -51,8 +60,30 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
+def plugin_version():
+    try:
+        with open(os.path.join(PLUGIN, ".claude-plugin", "plugin.json")) as f:
+            return json.load(f).get("version", "dev")
+    except (OSError, ValueError):
+        return "dev"
+
+
+def valid_session(session):
+    return bool(re.fullmatch(r"[\w-]{1,128}", session or ""))
+
+
 def session_file(session, suffix=""):
     return os.path.join(SESSIONS, session + suffix)
+
+
+def prune_sessions():
+    cutoff = time.time() - SESSION_TTL
+    for path in glob.glob(os.path.join(SESSIONS, "*")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.unlink(path)
+        except OSError:
+            pass
 
 
 def set_session(session, value):
@@ -62,7 +93,7 @@ def set_session(session, value):
 
 
 def is_on(session):
-    if not session:
+    if not valid_session(session):
         return False
     try:
         with open(session_file(session)) as f:
@@ -88,19 +119,33 @@ def send(req, timeout=2.0):
         s.close()
 
 
-def engine_status():
+def ping():
+    """(engine, version) of the running daemon, or None."""
     try:
-        reply = send({"cmd": "ping"}, timeout=1)
-        return "running (" + reply.split()[1] + ")" if reply.startswith("pong ") else "stopped"
-    except (OSError, IndexError):
-        return "stopped"
+        parts = send({"cmd": "ping"}, timeout=1).split()
+    except OSError:
+        return None
+    if not parts or parts[0] != "pong":
+        return None
+    return (parts[1] if len(parts) > 1 else "?", parts[2] if len(parts) > 2 else "?")
+
+
+def engine_status():
+    p = ping()
+    return f"running ({p[0]})" if p else "stopped"
 
 
 def daemon_alive():
-    try:
-        return send({"cmd": "ping"}, timeout=1).startswith("pong")
-    except OSError:
+    """True if a daemon from this plugin version is running; one from another version is told to quit."""
+    p = ping()
+    if p and p[1] != plugin_version():
+        try:
+            send({"cmd": "quit"}, timeout=2)
+        except OSError:
+            pass
+        time.sleep(0.5)
         return False
+    return p is not None
 
 
 def find_uv():
@@ -171,7 +216,8 @@ def ensure_daemon(wait=900):
     with FileLock(os.path.join(STATE, "daemon.lock")):  # one starter at a time; the rest then find it alive
         if daemon_alive():
             return True
-        env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE, PYTHONUNBUFFERED="1")
+        env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE, PYTHONUNBUFFERED="1",
+                   TALKBACK_VERSION=plugin_version())
         proc = spawn_detached([uv, "run", "--project", ENGINE, "--frozen", "python", os.path.join(ENGINE, "voiced.py")],
                               log_path=os.path.join(STATE, "voiced.log"), env=env, cwd=STATE)
         deadline = time.time() + wait
@@ -208,16 +254,21 @@ def pid_alive(pid):
         return False
 
 
-def helper_running():
+def helper_pid():
+    """PID of the running helper (macOS), or None. helper.pid holds "<pid> <binary mtime>"."""
     try:
         with open(HELPER_PID) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
-        return False
+            pid = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
     if not pid_alive(pid):
-        return False
+        return None
     out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="], capture_output=True, text=True).stdout
-    return out.strip().endswith("talkback-helper")
+    return pid if out.strip().endswith("talkback-helper") else None
+
+
+def helper_running():
+    return helper_pid() is not None
 
 
 def build_helper():
@@ -238,12 +289,26 @@ def build_helper():
 
 
 def ensure_helper():
-    if not IS_MAC or helper_running() or not build_helper():
+    """Run the macOS helper, restarting it if the plugin update rebuilt its binary."""
+    if not IS_MAC:
         return
-    proc = spawn_detached([HELPER_BIN], log_path=os.path.join(STATE, "helper.log"),
-                          env=dict(os.environ, TALKBACK_HOME=STATE))
-    with open(HELPER_PID, "w") as f:
-        f.write(str(proc.pid))
+    os.makedirs(STATE, exist_ok=True)
+    with FileLock(os.path.join(STATE, "helper-start.lock")):
+        if not build_helper():
+            return
+        built = str(int(os.path.getmtime(HELPER_BIN)))
+        pid = helper_pid()
+        if pid:
+            with open(HELPER_PID) as f:
+                fields = f.read().split()
+            if fields[1:2] == [built]:
+                return
+            os.kill(pid, 15)  # an older binary: replace it
+            time.sleep(0.3)
+        proc = spawn_detached([HELPER_BIN], log_path=os.path.join(STATE, "helper.log"),
+                              env=dict(os.environ, TALKBACK_HOME=STATE))
+        with open(HELPER_PID, "w") as f:
+            f.write(f"{proc.pid} {built}")
 
 
 # ---------- turning a reply into speech ----------
@@ -253,11 +318,13 @@ def find_transcript(session):
     return hits[0] if hits else ""
 
 
-def last_reply(transcript_path):
-    """Text of the last assistant message that has any text in it."""
+def last_reply(transcript_path, tail=4 << 20):
+    """Text of the last assistant message that has any text in it (looks at the transcript's last 4 MB)."""
     try:
-        with open(transcript_path, encoding="utf-8") as f:
-            lines = f.readlines()
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail))
+            lines = f.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
         return ""
     for line in reversed(lines):
@@ -285,10 +352,11 @@ def speakable(md, limit=MAX_CHARS):
     t = re.sub(r"`([^`]{1,40})`", r"\1", t)                        # short inline code: keep
     t = re.sub(r"`[^`]*`", "", t)                                  # long inline code: drop
     t = re.sub(r"~?/?(?:[\w.-]+/){2,}([\w.-]+)", r"\1", t)        # paths -> basename
+    t = re.sub(r"(?:[A-Za-z]:)?\\?(?:[\w.-]+\\){2,}([\w.-]+)", r"\1", t)  # Windows paths too
     t = re.sub(r"^\s*#+\s*", "", t, flags=re.M)                    # headings
     t = re.sub(r"^\s*(?:[-*+]|\d+\.)\s+(.*?)\s*$",                 # list items -> sentences
                lambda m: m.group(1) + ("" if m.group(1)[-1:] in ".!?:" else "."), t, flags=re.M)
-    t = re.sub(r"[*_]{1,3}([^*_]+)[*_]{1,3}", r"\1", t)            # bold/italic
+    t = re.sub(r"(?<!\w)([*_]{1,3})([^*_\n]+?)\1(?!\w)", r"\2", t)    # bold/italic, not snake_case
     t = re.sub(r"\s*(?:->|→)\s*", " to ", t)
     paras = [re.sub(r"\s+", " ", p).strip() for p in re.split(r"\n\s*\n", t)]
     out = ""
@@ -309,11 +377,11 @@ def hook(event):
     data = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
     session = data.get("session_id", "")
     if event == "stop":
-        if not is_on(session):
-            return
         skip = session_file(session, ".skipnext")
-        if os.path.exists(skip):
-            os.unlink(skip)
+        if valid_session(session) and os.path.exists(skip):
+            os.unlink(skip)  # the reply to `/talkback full`: let the full read-out keep playing
+            return
+        if not is_on(session):
             return
         text = data.get("last_assistant_message") or last_reply(data.get("transcript_path", ""))
         text = speakable(text if isinstance(text, str) else "", load_config().get("max_chars", MAX_CHARS))
@@ -326,12 +394,11 @@ def hook(event):
             except OSError:
                 pass
     elif event == "session-start":
+        prune_sessions()
         if is_on(session):
+            if os.path.exists(session_file(session)):
+                os.utime(session_file(session))  # keep a resumed session's switch from being pruned
             warm_detached()
-    elif event == "session-end":
-        for path in (session_file(session), session_file(session, ".skipnext")):
-            if os.path.exists(path):
-                os.unlink(path)
 
 
 # ---------- /talkback ----------
@@ -340,6 +407,9 @@ def command(args):
     session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     cfg = load_config()
     cmd = args[0] if args else ("off" if is_on(session) else "on")
+    if cmd in ("on", "off", "full") and not valid_session(session):
+        print("talkback couldn't find this session's ID (CLAUDE_CODE_SESSION_ID); please update Claude Code.")
+        return
     if cmd == "on":
         if not find_uv():
             print("talkback needs uv: https://docs.astral.sh/uv/getting-started/installation/")
@@ -368,14 +438,34 @@ def command(args):
         say_detached(text, session)
         print(f"Reading the last reply in full ({len(text)} characters).")
     elif cmd == "length" and len(args) > 1:
-        cfg["max_chars"] = 0 if args[1] in ("full", "all", "0") else int(args[1])
+        if args[1] in ("full", "all", "0"):
+            cfg["max_chars"] = 0
+        elif args[1].isdigit() and int(args[1]) >= 50:
+            cfg["max_chars"] = int(args[1])
+        else:
+            print("Length must be 'full' or a number of characters (50 or more).")
+            return
         save_config(cfg)
         print("Replies will be read in full." if not cfg["max_chars"]
               else f"Replies will be read up to {cfg['max_chars']} characters.")
-    elif cmd in ("voice", "speed") and len(args) > 1:
-        cfg[cmd] = args[1] if cmd == "voice" else float(args[1])
+    elif cmd == "voice" and len(args) > 1:
+        if args[1] not in VOICES:
+            print("Unknown voice. Pick one of: " + ", ".join(sorted(VOICES)) + ".")
+            return
+        cfg["voice"] = args[1]
         save_config(cfg)
-        print(f"{cmd.capitalize()} set to {args[1]}.")
+        print(f"Voice set to {args[1]}.")
+    elif cmd == "speed" and len(args) > 1:
+        try:
+            speed = float(args[1])
+        except ValueError:
+            speed = 0
+        if not 0.5 <= speed <= 2:
+            print("Speed must be a number from 0.5 to 2.")
+            return
+        cfg["speed"] = speed
+        save_config(cfg)
+        print(f"Speed set to {speed}.")
     elif cmd in ("autoenter", "default") and len(args) > 1 and args[1] in ("on", "off"):
         key = "autoenter" if cmd == "autoenter" else "default_on"
         cfg[key] = args[1] == "on"
@@ -383,8 +473,14 @@ def command(args):
         print({"autoenter": f"Auto-Enter after Hex dictation is {args[1]}.",
                "default_on": f"Talkback is now {args[1]} by default in new sessions."}[key])
     elif cmd == "say":
-        say_detached(speakable(" ".join(args[1:]), limit=0), session)
+        text = speakable(" ".join(args[1:]), limit=0)
+        if not text:
+            print("Nothing to say. Usage: /talkback say <text>")
+            return
+        say_detached(text, session)
         print("Speaking.")
+    elif cmd != "status":
+        print(USAGE)
     else:
         print(f"Talkback is {'on' if is_on(session) else 'off'} for this session. "
               f"voice={cfg.get('voice', 'af_heart')}, speed={cfg.get('speed', 1.1)}, "

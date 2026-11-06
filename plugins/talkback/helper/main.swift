@@ -2,9 +2,11 @@
 //
 // 1. Stop speech the moment any microphone turns on. Hex (and most dictation tools) open the mic only
 //    while you hold the hotkey, so pressing it cuts Kokoro off.
-// 2. Auto-Enter: after Hex pastes a dictation into Terminal or iTerm2, press Return, but only if the
-//    front tab's tty is running Claude Code (never at a plain shell prompt). Off with
-//    `/talkback autoenter off` ("autoenter": false in ~/.talkback/config.json).
+// 2. Auto-Enter: after Hex pastes a dictation into Terminal or iTerm2, press Return, but only if Claude Code
+//    is the foreground program of the front tab (never at a shell prompt, even with Claude suspended in the
+//    background). Off with `/talkback autoenter off` ("autoenter": false in ~/.talkback/config.json).
+//
+// Only one copy runs at a time (a lock on ~/.talkback/helper.lock), so Return is never pressed twice.
 import AppKit
 import ApplicationServices
 import CoreAudio
@@ -101,17 +103,20 @@ func frontTabRunsClaude(_ bundle: String) -> Bool {
     }
     let ps = Process()
     ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-    ps.arguments = ["-t", (tty as NSString).lastPathComponent, "-o", "args="]
+    ps.arguments = ["-t", (tty as NSString).lastPathComponent, "-o", "stat=,args="]
     let pipe = Pipe()
     ps.standardOutput = pipe
     guard (try? ps.run()) != nil else { return false }
     ps.waitUntilExit()
     let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    // Native installs run as `claude ...`; npm installs as `node .../claude-code/cli.js` or `.../bin/claude`.
     return out.split(separator: "\n").contains { line in
-        let argv0 = line.split(separator: " ").first.map(String.init) ?? ""
-        return (argv0 as NSString).lastPathComponent == "claude" || line.contains("claude-code/cli")
-            || line.contains("/bin/claude")
+        let fields = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        // "+" in STAT marks the terminal's foreground process group.
+        guard fields.count >= 2, fields[0].contains("+") else { return false }
+        let argv0 = (fields[1] as NSString).lastPathComponent
+        // Native installs run as `claude`; npm installs as `node <...>/@anthropic-ai/claude-code/cli.js`.
+        return argv0 == "claude"
+            || (["node", "bun"].contains(argv0) && fields.count >= 3 && fields[2].contains("claude-code"))
     }
 }
 
@@ -126,7 +131,15 @@ func pressReturn() {
 
 // MARK: - Main
 
-let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+let lockFd = open(state + "/helper.lock", O_CREAT | O_RDWR, 0o600)
+guard lockFd >= 0, flock(lockFd, LOCK_EX | LOCK_NB) == 0 else {
+    log("another talkback-helper is already running; exiting")
+    exit(0)
+}
+
+// Accessibility is needed to post the Return key; only ask for it when auto-Enter is on.
+let autoEnterOn = (config()["autoenter"] as? Bool) ?? true
+let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": autoEnterOn] as CFDictionary)
 log("started; accessibility trusted=\(trusted)")
 
 var micWasOn = micInUse()
