@@ -23,7 +23,7 @@ Then, in a Claude Code session:
 
 (In a headless `claude -p` session the command's full name is `/talkback:talkback`.)
 
-The first time, talkback installs Kokoro in the background into `~/.talkback` (a few hundred MB: the Python environment plus the voice model), which takes a minute or two. You'll hear replies once it's ready. `/talkback` with no argument toggles it.
+You don't install Kokoro yourself. The first time, talkback installs it in the background into `~/.talkback`: uv downloads the Python libraries, then talkback downloads the Kokoro voice model (from Hugging Face on Apple silicon, from GitHub elsewhere). That's a few hundred MB and takes a minute or two. You'll hear replies once it's ready. `/talkback` with no argument toggles it.
 
 ### How you talk
 
@@ -41,7 +41,7 @@ The simplest setup is `/voice tap` plus `/talkback on`: tap Space, talk, tap Spa
 
 ### Requirements
 
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) on your `PATH`. talkback's hooks run through `uv`, which also supplies Python, so you don't need Python installed.
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) on your `PATH`. This is the only thing you install by hand: talkback uses uv to fetch Python, Kokoro and the voice model on first use, so you don't install Python or Kokoro yourself.
   - macOS: `brew install uv`
   - Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
   - Windows: `winget install astral-sh.uv` (or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`)
