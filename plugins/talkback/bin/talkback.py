@@ -30,6 +30,10 @@ SESSIONS = os.path.join(STATE, "sessions")
 VENV = os.path.join(STATE, "venv")
 HELPER_BIN = os.path.join(STATE, "bin", "talkback-helper")
 HELPER_PID = os.path.join(STATE, "helper.pid")
+DAEMON_LOCK = os.path.join(STATE, "daemon.lock")
+STARTING = os.path.join(STATE, "starting.json")  # written while a starter waits for the daemon (first run: installs)
+INSTALLED = os.path.join(STATE, "installed")  # the daemon has come up at least once
+START_FAILED = os.path.join(STATE, "start-failed")
 MAX_CHARS = 700
 SESSION_TTL = 14 * 24 * 3600  # on/off switches of sessions untouched this long are pruned
 VOICES = {  # Kokoro v1.0 English voices: first letter a = American, b = British
@@ -132,7 +136,18 @@ def ping():
 
 def engine_status():
     p = ping()
-    return f"running ({p[0]})" if p else "stopped"
+    if p:
+        return f"running ({p[0]})"
+    info = starting()
+    if info:
+        mins = max(0, int(time.time() - info.get("since", time.time())) // 60)
+        if info.get("first"):
+            return (f"installing Kokoro, first run ({mins} min so far; usually a minute or two, "
+                    "longer on a slow connection)")
+        return "starting"
+    if os.path.exists(START_FAILED):
+        return f"stopped (the last start failed; see {os.path.join(STATE, 'voiced.log')})"
+    return "stopped"
 
 
 def daemon_alive():
@@ -205,29 +220,86 @@ class FileLock:
         self.f.close()  # closing releases the lock on both
 
 
+def lock_held(path):
+    """True if another process holds the FileLock on path (probes without waiting)."""
+    try:
+        f = open(path, "a+")
+    except OSError:
+        return False
+    with f:
+        try:
+            if IS_WIN:
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+    return False
+
+
+def starting():
+    """{"since": t, "first": bool} while the daemon is being started (or installed), else None."""
+    try:
+        with open(STARTING) as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return None
+    # The file is only meaningful while its starter still holds the lock (it may have been killed).
+    return info if isinstance(info, dict) and lock_held(DAEMON_LOCK) else None
+
+
 def ensure_daemon(wait=900):
     """Start the daemon if needed (the first start installs Kokoro, so it can take minutes)."""
     if daemon_alive():
+        if not os.path.exists(INSTALLED):  # installed before this marker existed
+            open(INSTALLED, "w").close()
         return True
     uv = find_uv()
     if not uv:
         return False
     os.makedirs(STATE, exist_ok=True)
-    with FileLock(os.path.join(STATE, "daemon.lock")):  # one starter at a time; the rest then find it alive
+    with FileLock(DAEMON_LOCK):  # one starter at a time; the rest then find it alive
         if daemon_alive():
             return True
-        env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE, PYTHONUNBUFFERED="1",
-                   TALKBACK_VERSION=plugin_version())
-        proc = spawn_detached([uv, "run", "--project", ENGINE, "--frozen", "python", os.path.join(ENGINE, "voiced.py")],
-                              log_path=os.path.join(STATE, "voiced.log"), env=env, cwd=STATE)
-        deadline = time.time() + wait
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                return False
-            if daemon_alive():
-                return True
-            time.sleep(0.5)
+        with open(STARTING, "w") as f:
+            json.dump({"since": time.time(), "first": not os.path.exists(INSTALLED)}, f)
+        try:
+            ok = start_daemon(uv, wait)
+        finally:
+            remove(STARTING)
+        if ok:
+            open(INSTALLED, "w").close()
+            remove(START_FAILED)
+        else:
+            open(START_FAILED, "w").close()
+        return ok
+
+
+def start_daemon(uv, wait):
+    env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE, PYTHONUNBUFFERED="1",
+               TALKBACK_VERSION=plugin_version())
+    proc = spawn_detached([uv, "run", "--project", ENGINE, "--frozen", "python", os.path.join(ENGINE, "voiced.py")],
+                          log_path=os.path.join(STATE, "voiced.log"), env=env, cwd=STATE)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        if daemon_alive():
+            return True
+        time.sleep(0.5)
     return False
+
+
+def remove(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def say_detached(text, session):
@@ -387,6 +459,11 @@ def hook(event):
         text = speakable(text if isinstance(text, str) else "", load_config().get("max_chars", MAX_CHARS))
         if text:
             say_detached(text, session)
+            info = starting()
+            if info and info.get("first"):
+                # Shown under the reply, so a silent first reply isn't a mystery.
+                print(json.dumps({"systemMessage": "talkback is still installing Kokoro (first run). This reply "
+                                  "will be spoken when it's ready; /talkback status shows progress."}))
     elif event == "prompt":
         if is_on(session):
             try:
@@ -415,11 +492,11 @@ def command(args):
             print("talkback needs uv: https://docs.astral.sh/uv/getting-started/installation/")
             return
         set_session(session, "on")
-        first = not os.path.isdir(VENV)
+        first = not os.path.exists(INSTALLED)
         warm_detached()
         print("Talkback is on for this session."
               + (" First-time setup is installing Kokoro in the background (a few hundred MB);"
-                 " replies start speaking in a minute or two." if first else ""))
+                 " replies start speaking in a minute or two. /talkback status shows progress." if first else ""))
     elif cmd == "off":
         set_session(session, "off")
         try:

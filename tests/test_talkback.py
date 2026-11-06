@@ -124,5 +124,32 @@ class HookTest(TalkbackTest):
         self.assertEqual(self.said, [("From file.", "test-session")])
 
 
+class InstallStatusTest(TalkbackTest):
+    def write_starting(self, first):
+        with open(self.tb.STARTING, "w") as f:
+            json.dump({"since": 0, "first": first}, f)
+
+    def test_status_while_installing(self):
+        self.write_starting(first=True)
+        with mock.patch.object(self.tb, "ping", return_value=None):
+            with self.tb.FileLock(self.tb.DAEMON_LOCK):
+                self.assertIn("installing Kokoro", self.tb.engine_status())
+            self.assertEqual(self.tb.engine_status(), "stopped")  # starter gone: the file is stale
+
+    def test_status_after_failed_start(self):
+        open(self.tb.START_FAILED, "w").close()
+        with mock.patch.object(self.tb, "ping", return_value=None):
+            self.assertIn("last start failed", self.tb.engine_status())
+
+    def test_stop_hook_says_it_is_still_installing(self):
+        self.tb.set_session("test-session", "on")
+        self.write_starting(first=True)
+        out = io.StringIO()
+        with self.tb.FileLock(self.tb.DAEMON_LOCK), redirect_stdout(out):
+            self.run_hook("stop", {"session_id": "test-session", "last_assistant_message": "Hi."})
+        self.assertEqual(self.said, [("Hi.", "test-session")])
+        self.assertIn("still installing", json.loads(out.getvalue())["systemMessage"])
+
+
 if __name__ == "__main__":
     unittest.main()

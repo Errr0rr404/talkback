@@ -21,9 +21,15 @@ Then, in a Claude Code session:
 /talkback on
 ```
 
-(In a headless `claude -p` session the command's full name is `/talkback:talkback`.)
+If Claude Code says `Unknown command` or `Unknown skill: talkback`, use the command's full name:
 
-You don't install Kokoro yourself. The first time, talkback installs it in the background into `~/.talkback`: uv downloads the Python libraries, then talkback downloads the Kokoro voice model (from Hugging Face on Apple silicon, from GitHub elsewhere). That's a few hundred MB and takes a minute or two. You'll hear replies once it's ready. `/talkback` with no argument toggles it.
+```
+/talkback:talkback on
+```
+
+Plugin commands are named `plugin:command`. Whether the short `/talkback` also works depends on your Claude Code version, and headless `claude -p` sessions only accept the full name. Every `/talkback ...` command in this README works the same as `/talkback:talkback ...`. If neither name is found right after installing, run `/reload-plugins` or start a new session.
+
+You don't install Kokoro yourself. The first time, talkback installs it in the background into `~/.talkback`: uv downloads the Python libraries, then talkback downloads the Kokoro voice model (from Hugging Face on Apple silicon, from GitHub elsewhere). That's a few hundred MB and takes a minute or two. Meanwhile `/talkback status` shows `engine=installing Kokoro`, and a reply that finishes before then shows a note saying it will be spoken once Kokoro is ready. `/talkback` with no argument toggles it.
 
 ### How you talk
 
@@ -90,7 +96,7 @@ State, logs and settings live in `~/.talkback/` (`voiced.log`, `helper.log`, `co
 
 ## Troubleshooting
 
-- **Nothing is spoken:** run `/talkback status`. If the engine shows `stopped`, look at `~/.talkback/voiced.log` (the first start downloads the model, so give it a minute or two).
+- **Nothing is spoken:** run `/talkback status`. `installing Kokoro` means the first-time download is still running; wait for it. `stopped (the last start failed ...)` or a plain `stopped` that doesn't change: look at `~/.talkback/voiced.log`. If it says `running` but you hear nothing, check your sound output device and volume, and try `/talkback say hello`.
 - **Hook errors mentioning `uv`:** uv isn't on the `PATH` that Claude Code sees. Install it and restart Claude Code.
 - **Linux is silent:** `voiced.log` says `no audio player found`; install `pipewire`, `pulseaudio-utils`, `alsa-utils` or `ffmpeg`.
 - **Auto-Enter doesn't press Return (macOS):** check `~/.talkback/helper.log`. `accessibility trusted=false` means your terminal app needs Accessibility permission; "front tab is not running claude" means the focused tab wasn't Claude Code.
