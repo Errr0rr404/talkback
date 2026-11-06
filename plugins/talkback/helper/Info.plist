@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>dev.talkback.helper</string>
+  <key>CFBundleName</key><string>talkback-helper</string>
+  <key>NSAppleEventsUsageDescription</key><string>Checks that the front terminal tab is running Claude Code before pressing Return after a Hex dictation.</string>
+</dict></plist>
