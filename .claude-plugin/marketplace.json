@@ -8,6 +8,7 @@
     {
       "name": "talkback",
       "source": "./plugins/talkback",
+      "version": "0.4.0",
       "description": "Hear Claude Code's replies in a local Kokoro voice; talk back with Hex, with auto-Enter and press-to-interrupt."
     }
   ],

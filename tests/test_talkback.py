@@ -6,6 +6,7 @@ import importlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -149,6 +150,270 @@ class InstallStatusTest(TalkbackTest):
             self.run_hook("stop", {"session_id": "test-session", "last_assistant_message": "Hi."})
         self.assertEqual(self.said, [("Hi.", "test-session")])
         self.assertIn("still installing", json.loads(out.getvalue())["systemMessage"])
+
+
+class UvBootstrapTest(TalkbackTest):
+    def setUp(self):
+        super().setUp()
+        # Hide any real uv: only a binary in ~/.talkback/uv (or one a test creates) counts.
+        self.fake_home = os.path.join(self.home.name, "fakehome")
+        os.makedirs(self.fake_home)
+        patcher = mock.patch.dict(os.environ, {"HOME": self.fake_home, "USERPROFILE": self.fake_home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        real_which = shutil.which
+        w = mock.patch.object(shutil, "which", lambda n, *a, **k: None if n == "uv" else real_which(n, *a, **k))
+        w.start()
+        self.addCleanup(w.stop)
+        e = mock.patch.object(os.path, "exists", side_effect=self._fake_exists)
+        e.start()
+        self.addCleanup(e.stop)
+
+    def _fake_exists(self, path):
+        if path in ("/opt/homebrew/bin/uv", "/usr/local/bin/uv"):
+            return False
+        return os.path.lexists(path)
+
+    def fake_installer(self, create=True):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            if create:
+                os.makedirs(self.tb.UV_DIR, exist_ok=True)
+                open(os.path.join(self.tb.UV_DIR, "uv"), "w").close()
+        return run, calls
+
+    def test_installer_argv_per_platform(self):
+        have = lambda *names: (lambda n: "/bin/" + n if n in names else None)
+        mac = self.tb.uv_install_argv(win=False, which=have("curl"))
+        self.assertEqual(mac[:2], ["sh", "-c"])
+        self.assertIn("curl -LsSf https://astral.sh/uv/install.sh | sh", mac[2])
+        linux = self.tb.uv_install_argv(win=False, which=have("wget"))
+        self.assertIn("wget -qO- https://astral.sh/uv/install.sh | sh", linux[2])
+        self.assertIsNone(self.tb.uv_install_argv(win=False, which=have()))
+        win = self.tb.uv_install_argv(win=True, which=have("powershell"))
+        self.assertEqual(win[0], "/bin/powershell")
+        self.assertIn("ByPass", win)
+        self.assertIn("irm https://astral.sh/uv/install.ps1 | iex", win[-1])
+        for argv in (mac, linux, win):
+            self.assertNotIn("sudo", " ".join(argv))
+            self.assertNotIn("brew", " ".join(argv))
+
+    def test_installer_env_keeps_path_alone(self):
+        env = self.tb.uv_install_env({"A": "b"})
+        self.assertEqual(env["UV_NO_MODIFY_PATH"], "1")
+        self.assertEqual(env["UV_UNMANAGED_INSTALL"], self.tb.UV_DIR)
+        self.assertEqual(env["A"], "b")
+
+    def test_installs_when_missing_then_finds_it_by_absolute_path(self):
+        self.assertIsNone(self.tb.find_uv())
+        run, calls = self.fake_installer()
+        uv = self.tb.ensure_uv(run=run)
+        self.assertEqual(uv, os.path.join(self.tb.UV_DIR, "uv"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["env"]["UV_UNMANAGED_INSTALL"], self.tb.UV_DIR)
+        self.assertFalse(os.path.exists(self.tb.UV_STARTING))
+        self.assertFalse(os.path.exists(self.tb.UV_FAILED))
+        self.tb.ensure_uv(run=run)
+        self.assertEqual(len(calls), 1)  # already there: installer not run again
+
+    def test_failed_install_fails_soft_and_status_explains(self):
+        run, calls = self.fake_installer(create=False)
+        self.assertIsNone(self.tb.ensure_uv(run=run))
+        self.assertTrue(os.path.exists(self.tb.UV_FAILED))
+        with mock.patch.object(self.tb, "ping", return_value=None):
+            status = self.tb.engine_status()
+        self.assertIn("needs uv", status)
+        self.assertIn("docs.astral.sh", status)
+        self.assertIsNone(self.tb.ensure_uv(run=run))  # retry throttled
+        self.assertEqual(len(calls), 1)
+        os.utime(self.tb.UV_FAILED, (0, 0))
+        self.tb.ensure_uv(run=run)  # old failure: tried again
+        self.assertEqual(len(calls), 2)
+
+    def test_installer_that_raises_is_a_soft_failure(self):
+        def run(argv, **kw):
+            raise OSError("no sh")
+        self.assertIsNone(self.tb.ensure_uv(run=run))
+        with open(self.tb.UV_LOG) as f:
+            self.assertIn("no sh", f.read())
+
+    def test_status_while_uv_installs(self):
+        with open(self.tb.UV_STARTING, "w") as f:
+            json.dump({"since": 0}, f)
+        with mock.patch.object(self.tb, "ping", return_value=None):
+            with self.tb.FileLock(self.tb.UV_LOCK):
+                self.assertIn("installing uv", self.tb.engine_status())
+            self.assertIn("waiting for uv", self.tb.engine_status())  # installer gone: stale file
+
+    def test_on_without_uv_starts_setup_and_says_so(self):
+        out = self.run_command("on")
+        self.assertIn("on for this session", out)
+        self.assertIn("uv, then Kokoro", out)
+        self.assertTrue(self.tb.is_on("test-session"))
+
+    def test_on_clears_an_old_failure_marker(self):
+        open(self.tb.UV_FAILED, "w").close()
+        self.run_command("on")
+        self.assertFalse(os.path.exists(self.tb.UV_FAILED))
+
+    def test_session_start_warms_on_first_run_only(self):
+        warmed = []
+        self.tb.warm_detached = lambda: warmed.append(1)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.run_hook("session-start", {"session_id": "s1"})
+        self.assertEqual(len(warmed), 1)
+        self.assertIn("uv, then Kokoro", json.loads(out.getvalue())["systemMessage"])
+        out = io.StringIO()
+        open(self.tb.INSTALLED, "w").close()
+        with redirect_stdout(out):
+            self.run_hook("session-start", {"session_id": "s1"})
+        self.assertEqual(len(warmed), 1)
+        self.assertEqual(out.getvalue(), "")  # the note is shown once
+
+    def test_session_start_does_not_loop_after_a_failed_start(self):
+        warmed = []
+        self.tb.warm_detached = lambda: warmed.append(1)
+        open(self.tb.START_FAILED, "w").close()
+        self.run_hook("session-start", {"session_id": "s1"})
+        self.assertEqual(warmed, [])
+
+    def test_warm_chains_uv_then_kokoro(self):
+        order = []
+        with mock.patch.object(self.tb, "ensure_uv", lambda: order.append("uv")), \
+                mock.patch.object(self.tb, "ensure_helper", lambda: order.append("helper")), \
+                mock.patch.object(self.tb, "ensure_daemon", lambda: order.append("kokoro")), \
+                mock.patch.object(sys, "argv", ["talkback.py", "_warm"]):
+            self.tb.main()
+        self.assertEqual(order, ["uv", "helper", "kokoro"])
+
+    def test_daemon_not_started_without_uv(self):
+        with mock.patch.object(self.tb, "ping", return_value=None):
+            self.assertFalse(self.tb.ensure_daemon())
+
+
+class HexSetupTest(TalkbackTest):
+    def test_not_offered_off_macos(self):
+        with mock.patch.object(self.tb, "IS_MAC", False):
+            out = self.run_command("setup", "yes")
+            self.assertIn("macOS only", out)
+            self.assertIn("/voice", out)
+
+    def test_first_run_note_mentions_setup_only_on_mac(self):
+        with mock.patch.object(self.tb, "IS_MAC", False):
+            self.assertNotIn("/talkback setup", self.tb.first_run_note())
+        os.unlink(self.tb.HEX_OFFERED)
+        with mock.patch.object(self.tb, "IS_MAC", True), mock.patch.object(self.tb, "hex_app", return_value=None):
+            self.assertIn("/talkback setup", self.tb.first_run_note())
+        self.assertIsNone(self.tb.first_run_note())
+
+    def test_declined_users_are_not_nagged(self):
+        self.tb.save_config({"hex_declined": True})
+        with mock.patch.object(self.tb, "IS_MAC", True), mock.patch.object(self.tb, "hex_app", return_value=None):
+            self.assertNotIn("/talkback setup", self.tb.first_run_note())
+
+    def test_setup_without_yes_only_offers(self):
+        with mock.patch.object(self.tb, "IS_MAC", True), mock.patch.object(self.tb, "hex_app", return_value=None), \
+                mock.patch.object(self.tb, "install_hex") as install, mock.patch.object(self.tb.subprocess, "run") as run:
+            out = self.run_command("setup")
+        self.assertIn("setup yes", out)
+        self.assertIn("kitlangton/Hex", out)
+        install.assert_not_called()
+        run.assert_not_called()
+
+    def test_setup_skip_is_remembered(self):
+        with mock.patch.object(self.tb, "IS_MAC", True):
+            self.run_command("setup", "skip")
+        self.assertTrue(self.tb.load_config()["hex_declined"])
+
+    def test_setup_yes_installs_and_opens_both_panes(self):
+        runs = []
+        with mock.patch.object(self.tb, "IS_MAC", True), mock.patch.object(self.tb, "hex_app", return_value=None), \
+                mock.patch.object(self.tb, "install_hex", return_value=(True, "Hex installed in /Applications.")), \
+                mock.patch.object(self.tb.subprocess, "run", side_effect=lambda argv, **kw: runs.append(argv)):
+            out = self.run_command("setup", "yes")
+        self.assertIn("Hex installed", out)
+        opened = [a[1] for a in runs if a[0] == "open"]
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(any("Privacy_Microphone" in u for u in opened))
+        self.assertTrue(any("Privacy_Accessibility" in u for u in opened))
+
+    def test_setup_yes_stops_when_install_fails(self):
+        with mock.patch.object(self.tb, "IS_MAC", True), mock.patch.object(self.tb, "hex_app", return_value=None), \
+                mock.patch.object(self.tb, "install_hex", return_value=(False, "couldn't install Hex (offline).")), \
+                mock.patch.object(self.tb.subprocess, "run") as run:
+            out = self.run_command("setup", "yes")
+        self.assertIn("offline", out)
+        run.assert_not_called()
+
+    def test_download_url_picks_the_dmg(self):
+        payload = {"assets": [{"name": "Hex.zip", "browser_download_url": "z"},
+                              {"name": "Hex-1.dmg", "browser_download_url": "https://x/Hex-1.dmg"}]}
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+        url = self.tb.hex_download_url(opener=lambda req, timeout: Resp(json.dumps(payload).encode()))
+        self.assertEqual(url, "https://x/Hex-1.dmg")
+
+    def test_install_hex_mounts_copies_and_detaches(self):
+        cmds = []
+
+        def run(argv, **kw):
+            cmds.append(argv[0])
+            if argv[0] == "hdiutil" and argv[1] == "attach":
+                os.makedirs(os.path.join(argv[argv.index("-mountpoint") + 1], "Hex.app"))
+        with mock.patch.object(self.tb.os, "access", return_value=True):
+            ok, msg = self.tb.install_hex(run=run, url_fn=lambda: "u", fetch=lambda url, dst: None)
+        self.assertTrue(ok, msg)
+        self.assertEqual(cmds, ["hdiutil", "ditto", "hdiutil"])
+
+    def test_install_hex_failure_still_detaches(self):
+        cmds = []
+
+        def run(argv, **kw):
+            cmds.append(argv[1])
+            if argv[1] == "attach":
+                os.makedirs(os.path.join(argv[argv.index("-mountpoint") + 1], "other"))
+        ok, msg = self.tb.install_hex(run=run, url_fn=lambda: "u", fetch=lambda url, dst: None)
+        self.assertFalse(ok)
+        self.assertEqual(cmds, ["attach", "detach"])
+
+
+class LauncherTest(unittest.TestCase):
+    """bin/run.sh with no uv and no Python on PATH must not fail a hook."""
+
+    def test_hook_without_uv_or_python_exits_zero(self):
+        import subprocess
+        src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
+        with tempfile.TemporaryDirectory() as home:
+            # A copy without the system-wide uv paths, so a uv installed on this machine can't be found.
+            run_sh = os.path.join(home, "run.sh")
+            with open(src) as f:
+                text = f.read().replace("/opt/homebrew/bin/uv /usr/local/bin/uv", "")
+            with open(run_sh, "w") as f:
+                f.write(text)
+            env = {"HOME": home, "PATH": "/nonexistent", "TALKBACK_HOME": os.path.join(home, "tb")}
+            for hook in ("stop", "prompt"):
+                r = subprocess.run(["/bin/sh", run_sh, "hook", hook], env=env, capture_output=True, text=True,
+                                   timeout=20, stdin=subprocess.DEVNULL)
+                self.assertEqual((r.returncode, r.stdout), (0, ""))
+            r = subprocess.run(["/bin/sh", run_sh, "status"], env=env, capture_output=True, text=True, timeout=20,
+                               stdin=subprocess.DEVNULL)
+            self.assertIn("installing uv", r.stdout)
+
+    def test_hooks_json_uses_the_launcher(self):
+        with open(os.path.join(ROOT, "plugins", "talkback", "hooks", "hooks.json")) as f:
+            hooks = json.load(f)["hooks"]
+        for groups in hooks.values():
+            for h in groups[0]["hooks"]:
+                self.assertEqual(h["command"], "sh")
+                self.assertTrue(h["args"][0].endswith("bin/run.sh"))
 
 
 if __name__ == "__main__":
