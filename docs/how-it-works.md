@@ -30,16 +30,19 @@ On Linux and Windows there's no reliable way yet to tell which terminal tab has 
 
 ## First run
 
-`/talkback on` starts the install in the background:
-- uv installs the Python libraries into `~/.talkback/venv`.
-- The service downloads the voice model: from Hugging Face on Apple silicon, from the kokoro-onnx GitHub release elsewhere.
+The first `SessionStart` after the plugin install (or `/talkback on`) starts a background job, `talkback.py _warm`, that chains:
+1. **uv.** Hooks run through `bin/run.sh`, which uses uv if it finds one (PATH, `~/.talkback/uv`, `~/.local/bin`, Homebrew, `~/.cargo/bin`), otherwise any Python 3.8+, otherwise (hook only) starts Astral's installer itself. `talkback.py` then runs Astral's standalone installer (`curl ... install.sh | sh`, or the PowerShell script on Windows) with `UV_UNMANAGED_INSTALL=~/.talkback/uv` and `UV_NO_MODIFY_PATH=1`, so there's no `sudo`, no PATH or profile edit, and uv is used by absolute path. A failure leaves `~/.talkback/uv-failed` (retried by hooks after an hour, or at once by `/talkback on`) and `/talkback status` says what's missing.
+2. **Kokoro.** uv installs the Python libraries into `~/.talkback/venv`, and the service downloads the voice model: from Hugging Face on Apple silicon, from the kokoro-onnx GitHub release elsewhere.
 
-While that runs, `/talkback status` shows `installing Kokoro`, and a reply that finishes early shows a note that it will be spoken once ready.
+While that runs, `/talkback status` shows `installing uv` or `installing Kokoro`, and a reply that finishes early shows a note that it will be spoken once ready.
+
+**Hex** is never installed from a hook. On macOS the first-run message mentions `/talkback setup`; `setup yes` downloads the `.dmg` from the latest release of kitlangton/Hex (it has no Homebrew cask), copies `Hex.app` to `/Applications`, and opens the Microphone and Accessibility panes.
 
 ## Files
 
 `~/.talkback/` holds:
 - `config.json`: settings.
+- `uv/`: uv, when talkback had to install it. `uv-install.log`: the installer's output.
 - `sessions/`: one on/off file per session, pruned after two weeks unused.
 - `voiced.log` and `helper.log`: the logs.
 
@@ -58,6 +61,7 @@ claude plugin marketplace add "$PWD" && claude plugin install talkback@talkback
 ```
 
 The plugin is in `plugins/talkback/`:
+- `bin/run.sh`: the launcher the hooks and `/talkback` go through.
 - `bin/talkback.py`: the hooks and the command. Standard library only, Python 3.8+.
 - `engine/`: the speech service and its locked dependencies.
 - `helper/`: the macOS helper.

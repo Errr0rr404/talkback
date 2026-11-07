@@ -6,8 +6,8 @@ Hooks (stdin is the hook's JSON):
 Commands (from /talkback):
   talkback.py [on|off|status|full|length <n|full>|voice <name>|speed <x>|autoenter on|off|default on|off|say <text>]
 
-Stdlib only, Python 3.8+, runs on macOS, Linux and Windows. Hooks launch it through `uv run --no-project`,
-so no system Python is needed. State lives in ~/.talkback.
+Stdlib only, Python 3.8+, runs on macOS, Linux and Windows. Hooks launch it through bin/run.sh, which uses
+`uv run --no-project` (so no system Python is needed) and installs uv itself if it's missing. State lives in ~/.talkback.
 """
 import glob
 import json
@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENGINE = os.path.join(PLUGIN, "engine")
@@ -34,6 +35,18 @@ DAEMON_LOCK = os.path.join(STATE, "daemon.lock")
 STARTING = os.path.join(STATE, "starting.json")  # written while a starter waits for the daemon (first run: installs)
 INSTALLED = os.path.join(STATE, "installed")  # the daemon has come up at least once
 START_FAILED = os.path.join(STATE, "start-failed")
+UV_DIR = os.path.join(STATE, "uv")  # uv's own installer puts the binary here when it installs it for us
+UV_LOCK = os.path.join(STATE, "uv.lock")
+UV_STARTING = os.path.join(STATE, "uv-starting.json")  # written while the uv installer runs
+UV_FAILED = os.path.join(STATE, "uv-failed")
+UV_LOG = os.path.join(STATE, "uv-install.log")
+UV_RETRY_AFTER = 3600  # after a failed uv install, hooks wait this long before trying again on their own
+UV_INSTALL_TIMEOUT = 600
+UV_URL_SH = "https://astral.sh/uv/install.sh"
+UV_URL_PS1 = "https://astral.sh/uv/install.ps1"
+UV_DOCS = "https://docs.astral.sh/uv/getting-started/installation/"
+HEX_OFFERED = os.path.join(STATE, "hex-offered")  # the first-run mention of /talkback setup was shown
+HEX_REPO = "kitlangton/Hex"
 MAX_CHARS = 700
 SESSION_TTL = 14 * 24 * 3600  # on/off switches of sessions untouched this long are pruned
 VOICES = {  # Kokoro v1.0 English voices: first letter a = American, b = British
@@ -43,7 +56,7 @@ VOICES = {  # Kokoro v1.0 English voices: first letter a = American, b = British
     "bm_george", "bm_lewis",
 }
 USAGE = ("Usage: /talkback [on|off|status|full|length <n|full>|voice <name>|speed <0.5-2>|"
-         "autoenter on|off|default on|off|say <text>]")
+         "autoenter on|off|default on|off|say <text>|setup [yes|skip]]")
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform == "win32"
 
@@ -138,6 +151,13 @@ def engine_status():
     p = ping()
     if p:
         return f"running ({p[0]})"
+    if not find_uv():
+        if uv_installing():
+            return "installing uv, first run (Kokoro follows; usually a few minutes in all)"
+        if os.path.exists(UV_FAILED):
+            return (f"needs uv: the automatic install failed (see {UV_LOG}). Install it yourself "
+                    f"({UV_DOCS}), then restart Claude Code")
+        return "waiting for uv (it installs by itself at the next session start or /talkback on)"
     info = starting()
     if info:
         mins = max(0, int(time.time() - info.get("since", time.time())) // 60)
@@ -166,11 +186,83 @@ def daemon_alive():
 def find_uv():
     home = os.path.expanduser("~")
     exe = "uv.exe" if IS_WIN else "uv"
-    for cand in (shutil.which("uv"), os.path.join(home, ".local", "bin", exe), "/opt/homebrew/bin/uv",
+    for cand in (shutil.which("uv"), os.path.join(UV_DIR, exe), os.path.join(home, ".local", "bin", exe),
+                 "/opt/homebrew/bin/uv",
                  "/usr/local/bin/uv", os.path.join(home, ".cargo", "bin", exe)):
         if cand and os.path.exists(cand):
             return cand
     return None
+
+
+def uv_install_argv(win=None, which=shutil.which):
+    """The argv of Astral's official standalone installer for this OS, or None if nothing can fetch it."""
+    if win is None:
+        win = IS_WIN
+    if win:
+        ps = which("powershell") or which("pwsh") or "powershell"
+        return [ps, "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", f"irm {UV_URL_PS1} | iex"]
+    if which("curl"):
+        return ["sh", "-c", f"curl -LsSf {UV_URL_SH} | sh"]
+    if which("wget"):
+        return ["sh", "-c", f"wget -qO- {UV_URL_SH} | sh"]
+    return None
+
+
+def uv_install_env(env=None):
+    """The installer drops uv into ~/.talkback/uv and leaves PATH and shell profiles alone."""
+    return dict(os.environ if env is None else env, UV_UNMANAGED_INSTALL=UV_DIR, UV_NO_MODIFY_PATH="1")
+
+
+def uv_installing():
+    try:
+        with open(UV_STARTING) as f:
+            json.load(f)
+    except (OSError, ValueError):
+        return False
+    return lock_held(UV_LOCK)  # the file is stale unless the installer still holds the lock
+
+
+def ensure_uv(run=None):
+    """Install uv with Astral's installer if it's missing. No sudo, no PATH changes. Returns the uv path or None."""
+    run = run or subprocess.run
+    uv = find_uv()
+    if uv:
+        return uv
+    try:
+        if time.time() - os.path.getmtime(UV_FAILED) < UV_RETRY_AFTER:
+            return None  # failed a moment ago: don't hammer the network on every session
+    except OSError:
+        pass
+    os.makedirs(STATE, exist_ok=True)
+    with FileLock(UV_LOCK):  # one installer at a time; the rest then find uv in place
+        uv = find_uv()
+        if uv:
+            return uv
+        with open(UV_STARTING, "w") as f:
+            json.dump({"since": time.time()}, f)
+        try:
+            argv = uv_install_argv()
+            ok = False
+            with open(UV_LOG, "w") as log:
+                if argv is None:
+                    log.write("talkback: neither curl nor wget found, so uv can't be downloaded.\n")
+                else:
+                    log.write("talkback: running " + " ".join(argv) + "\n")
+                    log.flush()
+                    try:
+                        run(argv, stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=uv_install_env(),
+                            timeout=UV_INSTALL_TIMEOUT)
+                    except (OSError, subprocess.SubprocessError) as e:
+                        log.write(f"talkback: installer failed to run: {e}\n")
+            uv = find_uv()
+            ok = bool(uv)
+        finally:
+            remove(UV_STARTING)
+        if ok:
+            remove(UV_FAILED)
+            return uv
+        open(UV_FAILED, "w").close()
+        return None
 
 
 def spawn_detached(argv, log_path=None, env=None, cwd=None):
@@ -443,6 +535,111 @@ def speakable(md, limit=MAX_CHARS):
     return out
 
 
+# ---------- Hex (macOS push-to-talk dictation), offered with consent ----------
+
+def hex_app():
+    """Path of an installed Hex.app, or None."""
+    for d in ("/Applications", os.path.join(os.path.expanduser("~"), "Applications")):
+        if os.path.isdir(os.path.join(d, "Hex.app")):
+            return os.path.join(d, "Hex.app")
+    return None
+
+
+def first_run_note():
+    """One-time hint shown at the first session start after install; None afterwards."""
+    if os.path.exists(HEX_OFFERED):
+        return None
+    os.makedirs(STATE, exist_ok=True)
+    open(HEX_OFFERED, "w").close()
+    note = ("talkback is setting up its voice in the background (uv, then Kokoro, a few hundred MB). "
+            "/talkback status shows progress; /talkback on turns it on.")
+    if IS_MAC and not hex_app() and not load_config().get("hex_declined"):
+        note += " To talk back with push-to-talk dictation, run /talkback setup (optional)."
+    return note
+
+
+PANES = ("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+         "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+
+
+def hex_download_url(opener=urllib.request.urlopen):
+    """URL of the .dmg on Hex's latest GitHub release (Hex has no Homebrew cask)."""
+    req = urllib.request.Request(f"https://api.github.com/repos/{HEX_REPO}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "talkback"})
+    with opener(req, timeout=20) as r:
+        data = json.load(r)
+    for asset in data.get("assets", []):
+        if asset.get("name", "").lower().endswith(".dmg"):
+            return asset["browser_download_url"]
+    raise OSError("no .dmg on the latest Hex release")
+
+
+def install_hex(run=None, url_fn=hex_download_url, fetch=urllib.request.urlretrieve):
+    """Download Hex's DMG and copy Hex.app to /Applications (or ~/Applications). Returns (ok, message)."""
+    run = run or subprocess.run
+    work = tempfile.mkdtemp(prefix="talkback-hex-")
+    mount = os.path.join(work, "mnt")
+    dmg = os.path.join(work, "Hex.dmg")
+    attached = False
+    try:
+        fetch(url_fn(), dmg)
+        os.makedirs(mount)
+        run(["hdiutil", "attach", "-nobrowse", "-readonly", "-quiet", "-mountpoint", mount, dmg], check=True)
+        attached = True
+        app = os.path.join(mount, "Hex.app")
+        if not os.path.isdir(app):
+            return False, "the Hex download didn't contain Hex.app"
+        dest = "/Applications"
+        if not os.access(dest, os.W_OK):
+            dest = os.path.join(os.path.expanduser("~"), "Applications")
+            os.makedirs(dest, exist_ok=True)
+        run(["ditto", app, os.path.join(dest, "Hex.app")], check=True)
+        return True, f"Hex installed in {dest}."
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return False, f"couldn't install Hex ({e}). Get it from https://github.com/{HEX_REPO}/releases"
+    finally:
+        if attached:
+            run(["hdiutil", "detach", "-quiet", mount], check=False)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def setup(args, run=None):
+    run = run or subprocess.run
+    if not IS_MAC:
+        return ("Nothing to set up here: Hex is macOS only. On Linux and Windows talkback's voice already works; "
+                "to talk back, use Claude Code's /voice.")
+    cfg = load_config()
+    arg = args[0] if args else ""
+    if arg == "skip":
+        cfg["hex_declined"] = True
+        save_config(cfg)
+        return "Skipped. talkback won't mention Hex again; use Claude Code's /voice to talk back."
+    if arg != "yes":
+        what = ("Hex is already installed. `/talkback setup yes` opens the Microphone and Accessibility panes "
+                "so you can allow it." if hex_app() else
+                "Hex (https://github.com/%s) is a free macOS app: hold a hotkey, speak, release, and talkback "
+                "presses Enter. `/talkback setup yes` downloads its latest release (about 15 MB) into "
+                "/Applications and opens the Microphone and Accessibility permission panes. "
+                "`/talkback setup skip` declines (use Claude Code's /voice instead)." % HEX_REPO)
+        return what
+    lines = []
+    if hex_app():
+        lines.append("Hex is already installed.")
+    else:
+        ok, msg = install_hex(run=run)
+        lines.append(msg)
+        if not ok:
+            return msg
+    for pane in PANES:
+        run(["open", pane], check=False)
+    lines.append("Opened System Settings: allow Hex under Microphone and Accessibility, and allow your terminal "
+                 "(Terminal or iTerm2) under Accessibility so talkback can press Enter. Then open Hex and set "
+                 "its hotkey.")
+    cfg.pop("hex_declined", None)
+    save_config(cfg)
+    return " ".join(lines)
+
+
 # ---------- hooks ----------
 
 def hook(event):
@@ -476,6 +673,11 @@ def hook(event):
             if os.path.exists(session_file(session)):
                 os.utime(session_file(session))  # keep a resumed session's switch from being pruned
             warm_detached()
+        elif not os.path.exists(INSTALLED) and not os.path.exists(START_FAILED):
+            warm_detached()  # first run after the plugin install: set up uv, then Kokoro, in the background
+        note = first_run_note()
+        if note:
+            print(json.dumps({"systemMessage": note}))
 
 
 # ---------- /talkback ----------
@@ -488,15 +690,16 @@ def command(args):
         print("talkback couldn't find this session's ID (CLAUDE_CODE_SESSION_ID); please update Claude Code.")
         return
     if cmd == "on":
-        if not find_uv():
-            print("talkback needs uv: https://docs.astral.sh/uv/getting-started/installation/")
-            return
         set_session(session, "on")
         first = not os.path.exists(INSTALLED)
+        have_uv = bool(find_uv())
+        if not have_uv:
+            remove(UV_FAILED)  # an explicit request: try the installer again now
         warm_detached()
         print("Talkback is on for this session."
-              + (" First-time setup is installing Kokoro in the background (a few hundred MB);"
-                 " replies start speaking in a minute or two. /talkback status shows progress." if first else ""))
+              + ((" First-time setup is installing " + ("" if have_uv else "uv, then ")
+                  + "Kokoro in the background (a few hundred MB); replies start speaking in a few minutes. "
+                  "/talkback status shows progress.") if first else ""))
     elif cmd == "off":
         set_session(session, "off")
         try:
@@ -556,6 +759,8 @@ def command(args):
             return
         say_detached(text, session)
         print("Speaking.")
+    elif cmd == "setup":
+        print(setup(args[1:]))
     elif cmd != "status":
         print(USAGE)
     else:
@@ -573,19 +778,21 @@ def main():
     if argv[:1] == ["hook"]:
         hook(argv[1] if len(argv) > 1 else "")
     elif argv[:1] == ["_warm"]:
+        ensure_uv()
         ensure_helper()
         ensure_daemon()
     elif argv[:1] == ["_say"]:
         with open(argv[2], encoding="utf-8") as f:
             text = f.read()
         os.unlink(argv[2])
+        ensure_uv()
         ensure_helper()
         if ensure_daemon():
             send({"cmd": "say", "session": argv[1] or None, "text": text}, timeout=30)
     elif argv[:1] == ["speak"]:
         # Pipe-friendly: `some command | talkback.py speak`
         text = speakable(" ".join(argv[1:]) or sys.stdin.read(), limit=0)
-        if text and ensure_daemon():
+        if text and ensure_uv() and ensure_daemon():
             send({"cmd": "say", "text": text}, timeout=30)
     else:
         command(argv)
