@@ -5,13 +5,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv",
+            "command": "sh",
             "args": [
-              "run",
-              "--no-project",
-              "--quiet",
-              "python",
-              "${CLAUDE_PLUGIN_ROOT}/bin/talkback.py",
+              "${CLAUDE_PLUGIN_ROOT}/bin/run.sh",
               "hook",
               "stop"
             ],
@@ -25,13 +21,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv",
+            "command": "sh",
             "args": [
-              "run",
-              "--no-project",
-              "--quiet",
-              "python",
-              "${CLAUDE_PLUGIN_ROOT}/bin/talkback.py",
+              "${CLAUDE_PLUGIN_ROOT}/bin/run.sh",
               "hook",
               "prompt"
             ],
@@ -45,13 +37,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv",
+            "command": "sh",
             "args": [
-              "run",
-              "--no-project",
-              "--quiet",
-              "python",
-              "${CLAUDE_PLUGIN_ROOT}/bin/talkback.py",
+              "${CLAUDE_PLUGIN_ROOT}/bin/run.sh",
               "hook",
               "session-start"
             ],
