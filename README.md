@@ -17,7 +17,7 @@ That's the whole install. The first time Claude Code starts a session, talkback 
 | What | Size | Where it goes |
 |---|---|---|
 | [uv](https://docs.astral.sh/uv/), only if you don't have it (Astral's official installer; your PATH and shell profile are left alone) | about 20 MB | `~/.talkback/uv` |
-| Python libraries and the [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) voice | a few hundred MB | `~/.talkback/venv` and the model cache, installed by uv |
+| Python libraries and the [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) voice | a few hundred MB | `~/.talkback/venv` and the model cache (`~/.talkback/models` or Hugging Face cache), installed by uv |
 | [Hex](https://github.com/kitlangton/Hex) (macOS only, optional, asked first; see below) | about 15 MB | `/Applications` |
 
 Then in Claude Code:
@@ -43,10 +43,10 @@ Hex is a macOS app that needs your Microphone and Accessibility permissions, so 
 
 | Command | What it does |
 |---|---|
-| `/talkback on` / `off` | Turn spoken replies on or off for this session |
+| `/talkback on` / `off` | Turn spoken replies on or off for this session (running `/talkback` alone toggles) |
 | `/talkback status` | Show settings and whether the voice is ready |
 | `/talkback full` | Read the last reply again, in full |
-| `/talkback length full` | Always read whole replies (`length 700` to trim again) |
+| `/talkback length full` | Always read whole replies (`full`, `all`, or `0`; `length 700` to trim again) |
 | `/talkback voice bf_emma` | Change the [voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md) (default `af_heart`) |
 | `/talkback speed 1.3` | Speaking speed, 0.5 to 2 |
 | `/talkback default on` | Turn it on in every new session |
