@@ -267,7 +267,7 @@ def ensure_uv(run=None):
 
 def spawn_detached(argv, log_path=None, env=None, cwd=None):
     """Start a process that outlives this one (and the hook that started it)."""
-    out = open(log_path, "a") if log_path else subprocess.DEVNULL
+    out = open(log_path, "a") if log_path else subprocess.DEVNULL  # noqa: SIM115 - closed below, after Popen
     try:
         if not IS_WIN:
             return subprocess.Popen(argv, stdout=out, stderr=out, stdin=subprocess.DEVNULL, env=env, cwd=cwd,
@@ -291,7 +291,7 @@ class FileLock:
     """Exclusive lock on a file, on POSIX and Windows."""
 
     def __init__(self, path):
-        self.f = open(path, "a+")
+        self.f = open(path, "a+")  # noqa: SIM115 - held for the object's lifetime; __exit__ closes it
 
     def __enter__(self):
         if IS_WIN:
@@ -315,7 +315,7 @@ class FileLock:
 def lock_held(path):
     """True if another process holds the FileLock on path (probes without waiting)."""
     try:
-        f = open(path, "a+")
+        f = open(path, "a+")  # noqa: SIM115 - used as a context manager just below
     except OSError:
         return False
     with f:
@@ -427,7 +427,8 @@ def helper_pid():
         return None
     if not pid_alive(pid):
         return None
-    out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="], capture_output=True, text=True).stdout
+    out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="], capture_output=True, text=True,
+                         check=False).stdout
     return pid if out.strip().endswith("talkback-helper") else None
 
 
@@ -441,7 +442,8 @@ def build_helper():
         return True
     os.makedirs(os.path.dirname(HELPER_BIN), exist_ok=True)
     if shutil.which("swiftc"):
-        r = subprocess.run([os.path.join(HELPER_SRC, "build.sh"), HELPER_BIN], capture_output=True, text=True)
+        r = subprocess.run([os.path.join(HELPER_SRC, "build.sh"), HELPER_BIN], capture_output=True, text=True,
+                           check=False)
         if r.returncode == 0:
             return True
     prebuilt = os.path.join(HELPER_SRC, "talkback-helper-arm64")
@@ -509,17 +511,17 @@ def last_reply(transcript_path, tail=4 << 20):
 
 def speakable(md, limit=MAX_CHARS):
     """Markdown reply -> plain sentences worth hearing; limit=0 keeps all of it."""
-    t = re.sub(r"```.*?```", " ", md, flags=re.S)                  # code blocks
-    t = re.sub(r"^\s*\|.*\|\s*$", " ", t, flags=re.M)              # tables
+    t = re.sub(r"```.*?```", " ", md, flags=re.DOTALL)            # code blocks
+    t = re.sub(r"^\s*\|.*\|\s*$", " ", t, flags=re.MULTILINE)      # tables
     t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)               # links -> label
     t = re.sub(r"https?://\S+", "a link", t)
     t = re.sub(r"`([^`]{1,40})`", r"\1", t)                        # short inline code: keep
     t = re.sub(r"`[^`]*`", "", t)                                  # long inline code: drop
     t = re.sub(r"~?/?(?:[\w.-]+/){2,}([\w.-]+)", r"\1", t)        # paths -> basename
     t = re.sub(r"(?:[A-Za-z]:)?\\?(?:[\w.-]+\\){2,}([\w.-]+)", r"\1", t)  # Windows paths too
-    t = re.sub(r"^\s*#+\s*", "", t, flags=re.M)                    # headings
+    t = re.sub(r"^\s*#+\s*", "", t, flags=re.MULTILINE)           # headings
     t = re.sub(r"^\s*(?:[-*+]|\d+\.)\s+(.*?)\s*$",                 # list items -> sentences
-               lambda m: m.group(1) + ("" if m.group(1)[-1:] in ".!?:" else "."), t, flags=re.M)
+               lambda m: m.group(1) + ("" if m.group(1)[-1:] in ".!?:" else "."), t, flags=re.MULTILINE)
     t = re.sub(r"(?<!\w)([*_]{1,3})([^*_\n]+?)\1(?!\w)", r"\2", t)    # bold/italic, not snake_case
     t = re.sub(r"\s*(?:->|→)\s*", " to ", t)
     paras = [re.sub(r"\s+", " ", p).strip() for p in re.split(r"\n\s*\n", t)]
@@ -617,10 +619,10 @@ def setup(args, run=None):
     if arg != "yes":
         what = ("Hex is already installed. `/talkback setup yes` opens the Microphone and Accessibility panes "
                 "so you can allow it." if hex_app() else
-                "Hex (https://github.com/%s) is a free macOS app: hold a hotkey, speak, release, and talkback "
+                f"Hex (https://github.com/{HEX_REPO}) is a free macOS app: hold a hotkey, speak, release, and talkback "
                 "presses Enter. `/talkback setup yes` downloads its latest release (about 15 MB) into "
                 "/Applications and opens the Microphone and Accessibility permission panes. "
-                "`/talkback setup skip` declines (use Claude Code's /voice instead)." % HEX_REPO)
+                "`/talkback setup skip` declines (use Claude Code's /voice instead).")
         return what
     lines = []
     if hex_app():

@@ -59,7 +59,7 @@ class SpeakableTest(TalkbackTest):
         self.assertEqual(self.tb.speakable("This is _important_ stuff"), "This is important stuff.")
 
     def test_limit_cuts_at_paragraph_or_sentence(self):
-        md = "\n\n".join(["Para number %d is here." % i for i in range(100)])
+        md = "\n\n".join([f"Para number {i} is here." for i in range(100)])
         short = self.tb.speakable(md, limit=100)
         self.assertLessEqual(len(short), 100)
         self.assertTrue(short.endswith("."))
@@ -210,9 +210,8 @@ class InstallStatusTest(TalkbackTest):
 
     def test_status_while_starting_not_first(self):
         self.write_starting(first=False)
-        with mock.patch.object(self.tb, "ping", return_value=None):
-            with self.tb.FileLock(self.tb.DAEMON_LOCK):
-                self.assertEqual(self.tb.engine_status(), "starting")
+        with mock.patch.object(self.tb, "ping", return_value=None), self.tb.FileLock(self.tb.DAEMON_LOCK):
+            self.assertEqual(self.tb.engine_status(), "starting")
 
     def test_status_when_daemon_running(self):
         with mock.patch.object(self.tb, "ping", return_value=("127.0.0.1:51123", "0.4.0")):
@@ -461,7 +460,7 @@ class HexSetupTest(TalkbackTest):
             cmds.append(argv[1])
             if argv[1] == "attach":
                 os.makedirs(os.path.join(argv[argv.index("-mountpoint") + 1], "other"))
-        ok, msg = self.tb.install_hex(run=run, url_fn=lambda: "u", fetch=lambda url, dst: None)
+        ok, _ = self.tb.install_hex(run=run, url_fn=lambda: "u", fetch=lambda url, dst: None)
         self.assertFalse(ok)
         self.assertEqual(cmds, ["attach", "detach"])
 
@@ -482,10 +481,10 @@ class LauncherTest(unittest.TestCase):
             env = {"HOME": home, "PATH": "/nonexistent", "TALKBACK_HOME": os.path.join(home, "tb")}
             for hook in ("stop", "prompt"):
                 r = subprocess.run(["/bin/sh", run_sh, "hook", hook], env=env, capture_output=True, text=True,
-                                   timeout=20, stdin=subprocess.DEVNULL)
+                                   timeout=20, stdin=subprocess.DEVNULL, check=False)
                 self.assertEqual((r.returncode, r.stdout), (0, ""))
             r = subprocess.run(["/bin/sh", run_sh, "status"], env=env, capture_output=True, text=True, timeout=20,
-                               stdin=subprocess.DEVNULL)
+                               stdin=subprocess.DEVNULL, check=False)
             self.assertIn("installing uv", r.stdout)
 
     def test_hooks_json_uses_the_launcher(self):
