@@ -43,20 +43,26 @@ While that runs, `/talkback status` shows `installing uv` or `installing Kokoro`
 `~/.talkback/` holds:
 - `config.json`: settings.
 - `uv/`: uv, when talkback had to install it. `uv-install.log`: the installer's output.
+- `venv/`: virtual environment with Kokoro runtime dependencies.
+- `models/`: ONNX voice models (`kokoro-v1.0.onnx`, `voices-v1.0.bin`) on Linux, Windows, and Intel Macs.
 - `sessions/`: one on/off file per session, pruned after two weeks unused.
+- `voiced.json`: socket address and auth token for the running daemon.
+- `bin/`: macOS helper binary (`talkback-helper`).
 - `voiced.log` and `helper.log`: the logs.
 
 ## Shell use
 
 ```sh
 npm test 2>&1 | tail -3 | uv run --no-project python <plugin>/bin/talkback.py speak
+# or with python3:
+npm test 2>&1 | tail -3 | python3 <plugin>/bin/talkback.py speak
 ```
 
 ## Development
 
 ```sh
 git clone https://github.com/Errr0rr404/talkback && cd talkback
-uv run --no-project python -m unittest discover -s tests
+python3 -m unittest discover -s tests  # or: uv run --no-project python -m unittest discover -s tests
 claude plugin marketplace add "$PWD" && claude plugin install talkback@talkback
 ```
 

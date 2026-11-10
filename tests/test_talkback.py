@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -92,6 +93,58 @@ class CommandTest(TalkbackTest):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "../../etc"
         self.assertIn("couldn't find this session", self.run_command("on"))
 
+    def test_toggle_without_arguments(self):
+        with mock.patch.object(self.tb, "find_uv", return_value="/usr/bin/uv"):
+            out = self.run_command()
+            self.assertIn("on for this session", out)
+            self.assertTrue(self.tb.is_on("test-session"))
+            with mock.patch.object(self.tb, "send", side_effect=OSError):
+                out = self.run_command()
+                self.assertIn("off for this session", out)
+                self.assertFalse(self.tb.is_on("test-session"))
+
+    def test_autoenter_and_default(self):
+        self.assertIn("Auto-Enter after Hex dictation is off.", self.run_command("autoenter", "off"))
+        self.assertEqual(self.tb.load_config().get("autoenter"), False)
+        self.assertIn("Auto-Enter after Hex dictation is on.", self.run_command("autoenter", "on"))
+        self.assertEqual(self.tb.load_config().get("autoenter"), True)
+        self.assertIn("Talkback is now on by default in new sessions.", self.run_command("default", "on"))
+        self.assertEqual(self.tb.load_config().get("default_on"), True)
+        self.assertIn("Talkback is now off by default in new sessions.", self.run_command("default", "off"))
+        self.assertEqual(self.tb.load_config().get("default_on"), False)
+
+    def test_say_command(self):
+        self.assertIn("Nothing to say.", self.run_command("say"))
+        out = self.run_command("say", "Hello", "world!")
+        self.assertIn("Speaking.", out)
+        self.assertEqual(self.said, [("Hello world!", "test-session")])
+
+    def test_full_command_without_transcript(self):
+        with mock.patch.object(self.tb, "find_transcript", return_value=""):
+            out = self.run_command("full")
+            self.assertIn("No previous reply to read.", out)
+
+    def test_full_command_with_transcript(self):
+        path = os.path.join(self.home.name, "t.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "This is a full response from assistant."}]}}) + "\n")
+        with mock.patch.object(self.tb, "find_transcript", return_value=path):
+            out = self.run_command("full")
+            self.assertIn("Reading the last reply in full", out)
+            self.assertEqual(self.said, [("This is a full response from assistant.", "test-session")])
+            self.assertTrue(os.path.exists(self.tb.session_file("test-session", ".skipnext")))
+
+    def test_status_command(self):
+        with mock.patch.object(self.tb, "find_uv", return_value="/usr/bin/uv"):
+            out = self.run_command("status")
+            self.assertIn("Talkback is off for this session.", out)
+            self.assertIn("voice=af_heart", out)
+            self.assertIn("speed=1.1", out)
+            self.assertIn("length=700", out)
+            self.assertIn("autoenter=on", out)
+            self.assertIn("default=off", out)
+            self.assertIn("engine=", out)
+
 
 class HookTest(TalkbackTest):
     def test_stop_speaks_only_when_on(self):
@@ -124,8 +177,26 @@ class HookTest(TalkbackTest):
         self.run_hook("stop", {"session_id": "test-session", "transcript_path": path})
         self.assertEqual(self.said, [("From file.", "test-session")])
 
+    def test_prompt_hook_stops_speech(self):
+        self.tb.set_session("test-session", "on")
+        sent = []
+        with mock.patch.object(self.tb, "send", lambda req, timeout=0.5: sent.append(req)):
+            self.run_hook("prompt", {"session_id": "test-session"})
+        self.assertEqual(sent, [{"cmd": "stop", "session": "test-session"}])
+
+    def test_prompt_hook_ignores_daemon_down(self):
+        self.tb.set_session("test-session", "on")
+        with mock.patch.object(self.tb, "send", side_effect=OSError("not running")):
+            self.run_hook("prompt", {"session_id": "test-session"})
+
 
 class InstallStatusTest(TalkbackTest):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(self.tb, "find_uv", return_value="/usr/bin/uv")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def write_starting(self, first):
         with open(self.tb.STARTING, "w") as f:
             json.dump({"since": 0, "first": first}, f)
@@ -136,6 +207,16 @@ class InstallStatusTest(TalkbackTest):
             with self.tb.FileLock(self.tb.DAEMON_LOCK):
                 self.assertIn("installing Kokoro", self.tb.engine_status())
             self.assertEqual(self.tb.engine_status(), "stopped")  # starter gone: the file is stale
+
+    def test_status_while_starting_not_first(self):
+        self.write_starting(first=False)
+        with mock.patch.object(self.tb, "ping", return_value=None):
+            with self.tb.FileLock(self.tb.DAEMON_LOCK):
+                self.assertEqual(self.tb.engine_status(), "starting")
+
+    def test_status_when_daemon_running(self):
+        with mock.patch.object(self.tb, "ping", return_value=("127.0.0.1:51123", "0.4.0")):
+            self.assertEqual(self.tb.engine_status(), "running (127.0.0.1:51123)")
 
     def test_status_after_failed_start(self):
         open(self.tb.START_FAILED, "w").close()
@@ -414,6 +495,62 @@ class LauncherTest(unittest.TestCase):
             for h in groups[0]["hooks"]:
                 self.assertEqual(h["command"], "sh")
                 self.assertTrue(h["args"][0].endswith("bin/run.sh"))
+
+
+class SessionLifecycleTest(TalkbackTest):
+    def test_prune_sessions(self):
+        os.makedirs(self.tb.SESSIONS, exist_ok=True)
+        old_file = os.path.join(self.tb.SESSIONS, "old-session")
+        new_file = os.path.join(self.tb.SESSIONS, "new-session")
+        with open(old_file, "w") as f:
+            f.write("on")
+        with open(new_file, "w") as f:
+            f.write("on")
+        old_time = time.time() - (self.tb.SESSION_TTL + 3600)
+        os.utime(old_file, (old_time, old_time))
+        self.tb.prune_sessions()
+        self.assertFalse(os.path.exists(old_file))
+        self.assertTrue(os.path.exists(new_file))
+
+    def test_daemon_alive_replaces_older_version(self):
+        sent = []
+        with mock.patch.object(self.tb, "ping", return_value=("127.0.0.1:5000", "0.3.0")), \
+             mock.patch.object(self.tb, "plugin_version", return_value="0.4.0"), \
+             mock.patch.object(self.tb, "send", lambda req, timeout=2.0: sent.append(req)), \
+             mock.patch.object(self.tb.time, "sleep", return_value=None):
+            alive = self.tb.daemon_alive()
+            self.assertFalse(alive)
+            self.assertEqual(sent, [{"cmd": "quit"}])
+
+    def test_daemon_alive_matching_version(self):
+        with mock.patch.object(self.tb, "ping", return_value=("127.0.0.1:5000", "0.4.0")), \
+             mock.patch.object(self.tb, "plugin_version", return_value="0.4.0"):
+            self.assertTrue(self.tb.daemon_alive())
+
+
+class MainTest(TalkbackTest):
+    def test_main_speak(self):
+        sent = []
+        with mock.patch.object(self.tb, "ensure_uv", return_value="/bin/uv"), \
+             mock.patch.object(self.tb, "ensure_daemon", return_value=True), \
+             mock.patch.object(self.tb, "send", lambda req, timeout=30: sent.append(req)), \
+             mock.patch.object(sys, "argv", ["talkback.py", "speak", "hello", "world"]):
+            self.tb.main()
+        self.assertEqual(sent, [{"cmd": "say", "text": "hello world."}])
+
+    def test_main_say_worker(self):
+        tmp = os.path.join(self.home.name, "say.txt")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("text from file")
+        sent = []
+        with mock.patch.object(self.tb, "ensure_uv", return_value="/bin/uv"), \
+             mock.patch.object(self.tb, "ensure_helper", return_value=None), \
+             mock.patch.object(self.tb, "ensure_daemon", return_value=True), \
+             mock.patch.object(self.tb, "send", lambda req, timeout=30: sent.append(req)), \
+             mock.patch.object(sys, "argv", ["talkback.py", "_say", "test-session", tmp]):
+            self.tb.main()
+        self.assertFalse(os.path.exists(tmp))
+        self.assertEqual(sent, [{"cmd": "say", "session": "test-session", "text": "text from file"}])
 
 
 if __name__ == "__main__":
