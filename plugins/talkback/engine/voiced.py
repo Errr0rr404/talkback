@@ -170,7 +170,7 @@ def player_factory():
 def mic_active_linux():
     try:
         out = subprocess.run(["pactl", "list", "short", "source-outputs"], capture_output=True, text=True,
-                             timeout=1).stdout
+                             timeout=1, check=False).stdout
     except (OSError, subprocess.SubprocessError):
         return False
     return bool(out.strip())
@@ -294,7 +294,7 @@ def handle(conn):
             conn.sendall(b"ok\n")
             try:
                 speak(req["text"], req.get("session"))
-            except Exception:
+            except Exception:  # noqa: BLE001 - a speaking failure must not kill the daemon
                 log("speaking failed:\n" + traceback.format_exc())
         elif cmd == "stop":
             stop(req.get("session"))
