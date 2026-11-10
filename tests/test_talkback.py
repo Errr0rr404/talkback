@@ -2,12 +2,14 @@
 
 Run: uv run --no-project python -m unittest discover -s tests
 """
+import ast
 import importlib
 import io
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -50,7 +52,8 @@ class TalkbackTest(unittest.TestCase):
 class SpeakableTest(TalkbackTest):
     def test_strips_markdown_and_code(self):
         md = "## Done\n\nI set up **the hook** -> see [docs](https://x.y/z).\n\n```sh\necho hi\n```\n\n- First\n- Second"
-        self.assertEqual(self.tb.speakable(md), "Done. I set up the hook to see docs. First. Second.")
+        self.assertEqual(self.tb.speakable(md),
+                         "Done. I set up the hook to see docs. First. Second. " + self.tb.TRIM_NOTE)
 
     def test_paths_become_file_names(self):
         self.assertEqual(self.tb.speakable("Edit ~/.claude/voice/hook.py now"), "Edit hook.py now.")
@@ -63,9 +66,25 @@ class SpeakableTest(TalkbackTest):
     def test_limit_cuts_at_paragraph_or_sentence(self):
         md = "\n\n".join([f"Para number {i} is here." for i in range(100)])
         short = self.tb.speakable(md, limit=100)
-        self.assertLessEqual(len(short), 100)
-        self.assertTrue(short.endswith("."))
-        self.assertEqual(len(self.tb.speakable(md, limit=0)), len(md.replace("\n\n", " ")))
+        self.assertTrue(short.endswith(" " + self.tb.TRIM_NOTE))
+        body = short[: -(len(self.tb.TRIM_NOTE) + 1)]
+        self.assertLessEqual(len(body), 100)
+        self.assertTrue(body.endswith("."))
+        full = self.tb.speakable(md, limit=0)
+        self.assertNotIn(self.tb.TRIM_NOTE, full)
+        self.assertEqual(len(full), len(md.replace("\n\n", " ")))
+
+    def test_tilde_fences_and_tables_say_they_were_trimmed(self):
+        tilde = "Look.\n\n~~~js\nconsole.log(1)\n~~~\n\nDone."
+        spoken = self.tb.speakable(tilde)
+        self.assertNotIn("console", spoken)
+        self.assertEqual(spoken, "Look. Done. " + self.tb.TRIM_NOTE)
+        table = "Rows.\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nEnd."
+        table_spoken = self.tb.speakable(table)
+        self.assertNotIn("|", table_spoken)
+        self.assertTrue(table_spoken.endswith(self.tb.TRIM_NOTE))
+        self.assertIn("Rows.", table_spoken)
+        self.assertEqual(self.tb.speakable("Nothing to cut."), "Nothing to cut.")
 
 
 class CommandTest(TalkbackTest):
@@ -269,7 +288,8 @@ class HookTest(TalkbackTest):
 class InstallStatusTest(TalkbackTest):
     def setUp(self):
         super().setUp()
-        # engine_status() reports "waiting for uv" before Kokoro when find_uv() is empty.
+        # engine_status asks for uv before it reports Kokoro. Stub it so a machine without uv
+        # still exercises the Kokoro lines (same patch test_on_off uses).
         patcher = mock.patch.object(self.tb, "find_uv", return_value="/usr/bin/uv")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -631,6 +651,117 @@ class ArgumentSafetyTest(unittest.TestCase):
             self.assertFalse(os.path.exists("/tmp/talkback-should-not-exist"))
 
 
+class MicWatchTest(unittest.TestCase):
+    """voiced.py imports the TTS stack at import, so load mic_watch on its own and drive it."""
+
+    def test_already_open_mic_is_not_a_new_press(self):
+        path = os.path.join(ROOT, "plugins", "talkback", "engine", "voiced.py")
+        with open(path) as f:
+            tree = ast.parse(f.read())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "mic_watch")
+        # After each sleep: (mic is on, something is playing). Playback starts while the mic
+        # is already open, so that is not a press. Off then on during speech is one press.
+        script = [
+            (True, False),
+            (True, True),
+            (False, True),
+            (True, True),
+        ]
+        state = {"player": None, "i": -1, "mic": True}
+        stops = []
+
+        def probe():
+            return state["mic"]
+
+        def sleep(_dt):
+            state["i"] += 1
+            if state["i"] >= len(script):
+                raise StopIteration
+            mic, playing = script[state["i"]]
+            state["mic"] = mic
+            state["player"] = object() if playing else None
+
+        ns = {
+            "time": type("T", (), {"sleep": staticmethod(sleep)}),
+            "current": state,
+            "stop": lambda: stops.append(1),
+            "log": lambda *a, **k: None,
+        }
+        exec(compile(ast.Module([fn], type_ignores=[]), path, "exec"), ns)
+        with self.assertRaises(StopIteration):
+            ns["mic_watch"](probe)
+        self.assertEqual(stops, [1])
+
+
+class DaemonStartTest(TalkbackTest):
+    def test_ping_clears_start_failed(self):
+        open(self.tb.START_FAILED, "w").close()
+        pong = "pong onnx " + self.tb.plugin_version()
+        with mock.patch.object(self.tb, "send", return_value=pong):
+            self.assertTrue(self.tb.ensure_daemon())
+            self.assertFalse(os.path.exists(self.tb.START_FAILED))
+            open(self.tb.START_FAILED, "w").close()
+            self.assertIn("running", self.tb.engine_status())
+        self.assertFalse(os.path.exists(self.tb.START_FAILED))
+
+    def test_start_timeout_kills_the_child(self):
+        # A session leader plus a grandchild, the shape of `uv run` spawning python.
+        # Killing only the leader leaves the grandchild running.
+        child_file = os.path.join(self.home.name, "childpid")
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", "sleep 60 & echo $! > \"$1\"; wait", "sh", child_file],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child_pid = None
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and not os.path.exists(child_file):
+                if proc.poll() is not None:
+                    self.fail("helper shell exited before the grandchild started")
+                time.sleep(0.02)
+            with open(child_file) as f:
+                child_pid = int(f.read().strip())
+            with mock.patch.object(self.tb, "spawn_detached", return_value=proc), \
+                    mock.patch.object(self.tb, "daemon_alive", return_value=False), \
+                    mock.patch.object(self.tb.time, "time", side_effect=[0, 999]):
+                self.assertFalse(self.tb.start_daemon("uv", 1))
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(self._gone(child_pid), "grandchild still running after the start timed out")
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            if child_pid and self._alive(child_pid):
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def _alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _gone(self, pid):
+        """True once pid has exited. A zombie counts: nothing is running it."""
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if not self._alive(pid):
+                return True
+            try:
+                with open("/proc/%d/stat" % pid) as f:
+                    stat = f.read()
+            except OSError:
+                return True
+            if stat.rsplit(")", 1)[-1].split()[0] == "Z":
+                return True
+            time.sleep(0.05)
+        return False
+
+
 class LauncherTest(unittest.TestCase):
     """bin/run.sh with no uv and no Python on PATH must not fail a hook."""
 
@@ -675,6 +806,133 @@ class LauncherTest(unittest.TestCase):
             self.assertIn("installing uv", proc.stdout)
             self.assertNotIn("should-not-run", proc.stdout)
             self.assertEqual(os.listdir(tmp), [])
+
+    def test_session_start_locks_install_and_records_failure(self):
+        src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
+        with tempfile.TemporaryDirectory() as home:
+            state = os.path.join(home, "tb")
+            os.makedirs(state)
+            run_sh = os.path.join(home, "run.sh")
+            with open(src) as f:
+                text = f.read().replace("/opt/homebrew/bin/uv /usr/local/bin/uv", "")
+            with open(run_sh, "w") as f:
+                f.write(text)
+            bin_dir = os.path.join(home, "bin")
+            os.makedirs(bin_dir)
+            for name in ("flock", "date", "stat", "mkdir", "rm", "grep", "sleep"):
+                os.symlink(shutil.which(name), os.path.join(bin_dir, name))
+            curl_log = os.path.join(home, "curl.log")
+            stamp = os.path.join(home, "curl.stamp")
+            with open(os.path.join(bin_dir, "curl"), "w") as f:
+                f.write("#!/bin/sh\n"
+                        "if [ -f \"$CURL_STAMP\" ]; then echo overlap >> \"$CURL_LOG\"; fi\n"
+                        "echo $$ > \"$CURL_STAMP\"\n"
+                        "echo called >> \"$CURL_LOG\"\n"
+                        "if [ ! -f \"$TALKBACK_HOME/uv-starting.json\" ] || "
+                        "! grep -q since \"$TALKBACK_HOME/uv-starting.json\"; then\n"
+                        "  echo bad-starting >> \"$CURL_LOG\"\n"
+                        "fi\n"
+                        "if [ -n \"$CURL_DELAY\" ]; then sleep \"$CURL_DELAY\"; fi\n"
+                        "rm -f \"$CURL_STAMP\"\n"
+                        "exit 0\n")
+            os.chmod(os.path.join(bin_dir, "curl"), 0o755)
+            env = {
+                "HOME": home,
+                "PATH": bin_dir,  # no python and no uv, so run.sh takes the shell installer
+                "TALKBACK_HOME": state,
+                "CURL_LOG": curl_log,
+                "CURL_STAMP": stamp,
+            }
+
+            def log():
+                try:
+                    with open(curl_log) as f:
+                        return f.read()
+                except OSError:
+                    return ""
+
+            def installers():
+                r = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True)
+                return "\n".join(line for line in r.stdout.splitlines()
+                                 if "uv.lock" in line or "_uv_install" in line)
+
+            def launch(extra=None):
+                child_env = dict(env)
+                if extra:
+                    child_env.update(extra)
+                proc = subprocess.Popen(["/bin/sh", run_sh, "hook", "session-start"], env=child_env,
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, start_new_session=True)
+                procs.append(proc)
+                return proc
+
+            def wait_for(pred, timeout=8):
+                end = time.time() + timeout
+                while time.time() < end:
+                    if pred():
+                        return True
+                    time.sleep(0.05)
+                return False
+
+            procs = []
+            os.environ["TALKBACK_HOME"] = state
+            import talkback
+            tb = importlib.reload(talkback)
+            try:
+                # Same uv.lock FileLock as ensure_uv: the installer blocks until we release it.
+                with tb.FileLock(tb.UV_LOCK):
+                    first = launch()
+                    first.wait(timeout=5)
+                    blocked = wait_for(lambda: "flock" in installers() and log() == "")
+                    self.assertTrue(blocked, "installer did not block on uv.lock\nlog=%r\nps=%r"
+                                    % (log(), installers()))
+                    self.assertFalse(os.path.exists(tb.UV_STARTING))
+                self.assertTrue(wait_for(lambda: installers() == "" and os.path.exists(tb.UV_FAILED)),
+                                "first installer did not finish\nlog=%r\nps=%r" % (log(), installers()))
+                self.assertEqual(log().count("called"), 1)
+                self.assertNotIn("bad-starting", log())
+                self.assertNotIn("overlap", log())
+                self.assertFalse(os.path.exists(tb.UV_STARTING))
+                status = subprocess.run(["/bin/sh", run_sh, "status"], env=env, capture_output=True,
+                                        text=True, timeout=20, stdin=subprocess.DEVNULL)
+                self.assertEqual(status.returncode, 0)
+                self.assertIn(os.path.join(state, "uv-install.log"), status.stdout)
+                self.assertIn("failed", status.stdout)
+                self.assertNotIn("installing uv", status.stdout)
+                # A recent failure is not retried by the next session start.
+                again = launch()
+                again.wait(timeout=5)
+                time.sleep(0.4)
+                self.assertEqual(log().count("called"), 1)
+                self.assertNotIn("_uv_install", installers())
+                # An old failure is retried, and two at once still run one installer.
+                os.utime(tb.UV_FAILED, (0, 0))
+                pair = [launch({"CURL_DELAY": "0.4"}), launch({"CURL_DELAY": "0.4"})]
+                for proc in pair:
+                    proc.wait(timeout=5)  # the launcher returns; the locked installer keeps running
+                self.assertTrue(wait_for(lambda: installers() == "" and log().count("called") >= 2),
+                                "overlapping installers did not finish\nlog=%r\nps=%r\nfailed-mtime=%s"
+                                % (log(), installers(), os.path.getmtime(tb.UV_FAILED)))
+                self.assertEqual(log().count("called"), 2)
+                self.assertNotIn("overlap", log())
+                self.assertNotIn("bad-starting", log())
+                self.assertTrue(os.path.exists(tb.UV_FAILED))
+            finally:
+                for proc in procs:
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except OSError:
+                            pass
+                for proc in procs:
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        proc.wait(timeout=2)
 
     def test_hooks_json_uses_the_launcher(self):
         with open(os.path.join(ROOT, "plugins", "talkback", "hooks", "hooks.json")) as f:
