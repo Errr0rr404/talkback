@@ -702,7 +702,7 @@ def command(args):
     session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     cfg = load_config()
     cmd = args[0] if args else ("off" if is_on(session) else "on")
-    if cmd in ("on", "off", "full") and not valid_session(session):
+    if cmd in ("on", "off", "full", "say") and not valid_session(session):
         print("talkback couldn't find this session's ID (CLAUDE_CODE_SESSION_ID); please update Claude Code.")
         return
     if cmd == "on":
@@ -794,8 +794,11 @@ def command(args):
 
 def main():
     argv = sys.argv[1:]
+    # Words saved for /talkback are a user command. They go straight to command() so a
+    # file containing hook, _say or _warm cannot reach those internal entry points.
     if argv[:1] == ["--args-file"] and len(argv) > 1:
-        argv = argv_from_args_file(argv[1])
+        command(argv_from_args_file(argv[1]))
+        return
     if argv[:1] == ["hook"]:
         hook(argv[1] if len(argv) > 1 else "")
     elif argv[:1] == ["_warm"]:

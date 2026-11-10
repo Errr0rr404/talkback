@@ -40,4 +40,8 @@ if [ "$1" = "hook" ] && [ "$2" = "session-start" ] && command -v curl >/dev/null
   exit 0
 fi
 [ "$1" = "hook" ] && exit 0
+# Nothing will read the saved words. Remove them before telling the user to retry.
+if [ "$1" = "--args-file" ] && [ -n "$2" ]; then
+  rm -f "$2"
+fi
 echo "talkback is installing uv in the background; try again in a minute. If that doesn't help, install uv: https://docs.astral.sh/uv/getting-started/installation/"

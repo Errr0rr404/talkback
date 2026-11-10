@@ -147,6 +147,18 @@ class CommandTest(TalkbackTest):
             self.assertIn("default=off", out)
             self.assertIn("engine=", out)
 
+    def test_say_does_not_write_skipnext_without_a_valid_session(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "../../etc"
+        leaked = os.path.normpath(self.tb.session_file("../../etc", ".skipnext"))
+        try:
+            out = self.run_command("say", "hello")
+            self.assertIn("couldn't find this session", out)
+            self.assertEqual(self.said, [])
+            self.assertFalse(os.path.exists(leaked))
+        finally:
+            if os.path.exists(leaked):
+                os.remove(leaked)
+
     def test_say_sets_skipnext_so_the_acknowledgement_is_not_spoken(self):
         out = self.run_command("say", "hello", "there")
         self.assertIn("Speaking.", out)
@@ -169,6 +181,34 @@ class CommandTest(TalkbackTest):
         self.assertEqual(self.said, [("it's ready; echo $(HOME).", "test-session")])
         self.assertIn("Speaking.", out.getvalue())
         self.assertTrue(os.path.exists(self.tb.session_file("test-session", ".skipnext")))
+
+    def test_args_file_words_cannot_reach_internal_subcommands(self):
+        sentinel = os.path.join(self.home.name, "do-not-read.txt")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write("secret")
+        calls = []
+        self.tb.hook = lambda event: calls.append(("hook", event))
+        self.tb.ensure_uv = lambda: calls.append("ensure_uv")
+        self.tb.ensure_helper = lambda: calls.append("ensure_helper")
+        self.tb.ensure_daemon = lambda: calls.append("ensure_daemon") or False
+        self.tb.send = lambda *a, **k: calls.append("send")
+        for line in (
+            "_say test-session " + sentinel,
+            "hook session-start",
+            "_warm",
+        ):
+            path = os.path.join(self.home.name, "args.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(line + "\n")
+            out = io.StringIO()
+            with mock.patch.object(sys, "argv", ["talkback.py", "--args-file", path]), redirect_stdout(out):
+                self.tb.main()
+            self.assertFalse(os.path.exists(path), line)
+            self.assertIn("Usage", out.getvalue(), line)
+            self.assertEqual(self.said, [], line)
+        self.assertEqual(calls, [])
+        with open(sentinel, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "secret")
 
 
 class HookTest(TalkbackTest):
@@ -229,8 +269,6 @@ class HookTest(TalkbackTest):
 class InstallStatusTest(TalkbackTest):
     def setUp(self):
         super().setUp()
-
-
         # engine_status() reports "waiting for uv" before Kokoro when find_uv() is empty.
         patcher = mock.patch.object(self.tb, "find_uv", return_value="/usr/bin/uv")
         patcher.start()
@@ -616,6 +654,29 @@ class LauncherTest(unittest.TestCase):
             r = subprocess.run(["/bin/sh", run_sh, "status"], env=env, capture_output=True, text=True, timeout=20,
                                stdin=subprocess.DEVNULL, check=False)
             self.assertIn("installing uv", r.stdout)
+
+    def test_no_runtime_removes_the_argument_file(self):
+        src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
+        with tempfile.TemporaryDirectory() as home:
+            run_sh = os.path.join(home, "run.sh")
+            with open(src, encoding="utf-8") as f:
+                text = f.read().replace("/opt/homebrew/bin/uv /usr/local/bin/uv", "")
+            with open(run_sh, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.chmod(run_sh, 0o755)
+            bin_dir = os.path.join(home, "bin")
+            os.makedirs(bin_dir)
+            for tool in ("mktemp", "cat", "rm"):
+                os.symlink(shutil.which(tool), os.path.join(bin_dir, tool))
+            tmp = os.path.join(home, "tmp")
+            os.makedirs(tmp)
+            env = {"HOME": home, "PATH": bin_dir, "TALKBACK_HOME": os.path.join(home, "tb"), "TMPDIR": tmp}
+            proc = subprocess.run(["/bin/sh", run_sh, "--from-stdin"], env=env,
+                                  input="say hello; echo should-not-run\n",
+                                  capture_output=True, text=True, timeout=20)
+            self.assertIn("installing uv", proc.stdout)
+            self.assertNotIn("should-not-run", proc.stdout)
+            self.assertEqual(os.listdir(tmp), [])
 
     def test_hooks_json_uses_the_launcher(self):
         with open(os.path.join(ROOT, "plugins", "talkback", "hooks", "hooks.json")) as f:
