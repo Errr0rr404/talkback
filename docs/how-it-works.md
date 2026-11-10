@@ -54,8 +54,6 @@ While that runs, `/talkback status` shows `installing uv` or `installing Kokoro`
 
 ```sh
 npm test 2>&1 | tail -3 | uv run --no-project python <plugin>/bin/talkback.py speak
-# or with python3:
-npm test 2>&1 | tail -3 | python3 <plugin>/bin/talkback.py speak
 ```
 
 ## Development
