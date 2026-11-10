@@ -394,6 +394,16 @@ def remove(path):
         pass
 
 
+def argv_from_args_file(path):
+    """Words for /talkback, saved by run.sh. Whitespace separates them; nothing is expanded."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    finally:
+        remove(path)
+    return text.split()
+
+
 def say_detached(text, session):
     """Hand off to a background child so a hook returns at once, even on a cold start."""
     # Text goes through a file: Windows caps a command line at 32k characters.
@@ -664,6 +674,10 @@ def hook(event):
                 print(json.dumps({"systemMessage": "talkback is still installing Kokoro (first run). This reply "
                                   "will be spoken when it's ready; /talkback status shows progress."}))
     elif event == "prompt":
+        # An interrupted turn never reaches Stop, so a .skipnext it left behind would silence the
+        # next reply. This hook runs before a slash command writes a fresh marker for this turn.
+        if valid_session(session):
+            remove(session_file(session, ".skipnext"))
         if is_on(session):
             try:
                 send({"cmd": "stop", "session": session}, timeout=0.5)
@@ -759,6 +773,9 @@ def command(args):
         if not text:
             print("Nothing to say. Usage: /talkback say <text>")
             return
+        # The reply to this command is "Speaking."; skip it or speak() cuts off the requested line.
+        os.makedirs(SESSIONS, exist_ok=True)
+        open(session_file(session, ".skipnext"), "w").close()
         say_detached(text, session)
         print("Speaking.")
     elif cmd == "setup":
@@ -777,6 +794,8 @@ def command(args):
 
 def main():
     argv = sys.argv[1:]
+    if argv[:1] == ["--args-file"] and len(argv) > 1:
+        argv = argv_from_args_file(argv[1])
     if argv[:1] == ["hook"]:
         hook(argv[1] if len(argv) > 1 else "")
     elif argv[:1] == ["_warm"]:
