@@ -1,10 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "talkback",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Hear Claude Code's replies in a natural local voice (Kokoro-82M). Talk back with Hex: auto-Enter when you let go of the hotkey, and speech stops the moment you press it.",
   "author": {
-    "name": "Samian",
+    "name": "Zan",
     "url": "https://github.com/Errr0rr404"
   },
   "license": "MIT",
