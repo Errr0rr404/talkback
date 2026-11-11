@@ -550,17 +550,19 @@ class ArgumentSafetyTest(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             text = f.read()
         self.assertEqual(text.count("$ARGUMENTS"), 1)
-        self.assertIn('allowed-tools: "Bash(exec sh:*)"', text)
-        match = re.search(r"^```!\n(.*)^```\s*$", text, re.M | re.S)
+        # Claude Code (2.1.318) refuses `exec` in a command's shell block, so the guard against a line
+        # that closes the heredoc early is the permission rule: it allows only run.sh --from-stdin, and
+        # any other command the words smuggle in after that line needs the user's approval.
+        prefix = 'sh "${CLAUDE_PLUGIN_ROOT}/bin/run.sh" --from-stdin'
+        self.assertIn("\nallowed-tools: Bash(" + prefix + ":*)\n", text)
+        match = re.search(r"^```!\n(.*)^```\s*$", text, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(match)
         script = match.group(1)
-        self.assertTrue(script.lstrip().startswith("exec sh "))
-        self.assertIn("<<'TALKBACK_EOF'", script)
+        self.assertEqual(script.splitlines()[0], prefix + " <<'TALKBACK_EOF'")
         return script
 
     def test_shell_command_passes_text_literally(self):
         script = self.command_script()
-        delim = re.search(r"<<'(\w+)'", script).group(1)
         with tempfile.TemporaryDirectory() as root:
             bindir = os.path.join(root, "bin")
             os.makedirs(bindir)
@@ -579,12 +581,11 @@ class ArgumentSafetyTest(unittest.TestCase):
                 "say hello; echo PWNED",
                 "say `touch " + os.path.join(root, "pwned") + "`",
                 'say hello"; touch ' + os.path.join(root, "pwned") + '; echo "',
-                "say hello\n" + delim + "\ntouch " + os.path.join(root, "pwned"),
             ]
             for payload in payloads:
                 marker = os.path.join(root, "pwned")
                 proc = subprocess.run(["bash", "-c", script.replace("$ARGUMENTS", payload, 1)],
-                                      env=env, capture_output=True, text=True, timeout=20)
+                                      env=env, capture_output=True, text=True, timeout=20, check=False)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertNotIn("PWNED", proc.stdout)
                 self.assertFalse(os.path.exists(marker), payload)
@@ -593,10 +594,7 @@ class ArgumentSafetyTest(unittest.TestCase):
                 with open(capture + ".stdin", encoding="utf-8") as f:
                     got = f.read()
                 self.assertNotIn("/talkback-home-should-not-expand", got)
-                if payload.startswith("say hello\n" + delim):
-                    self.assertEqual(got, "say hello\n")
-                else:
-                    self.assertEqual(got, payload + "\n")
+                self.assertEqual(got, payload + "\n")
 
     def test_run_sh_forwards_stdin_without_parsing_it(self):
         src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
@@ -627,7 +625,7 @@ class ArgumentSafetyTest(unittest.TestCase):
             payload = "say it's ready; echo $(HOME) > /tmp/talkback-should-not-exist\n"
             env = {"HOME": home, "PATH": bin_dir, "TALKBACK_HOME": os.path.join(home, "tb")}
             proc = subprocess.run(["/bin/sh", run_sh, "--from-stdin"], env=env, input=payload,
-                                  capture_output=True, text=True, timeout=20)
+                                  capture_output=True, text=True, timeout=20, check=False)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout, payload)
             self.assertFalse(os.path.exists("/tmp/talkback-should-not-exist"))
@@ -673,7 +671,7 @@ class LauncherTest(unittest.TestCase):
             env = {"HOME": home, "PATH": bin_dir, "TALKBACK_HOME": os.path.join(home, "tb"), "TMPDIR": tmp}
             proc = subprocess.run(["/bin/sh", run_sh, "--from-stdin"], env=env,
                                   input="say hello; echo should-not-run\n",
-                                  capture_output=True, text=True, timeout=20)
+                                  capture_output=True, text=True, timeout=20, check=False)
             self.assertIn("installing uv", proc.stdout)
             self.assertNotIn("should-not-run", proc.stdout)
             self.assertEqual(os.listdir(tmp), [])
