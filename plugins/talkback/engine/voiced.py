@@ -3,7 +3,7 @@
 Listens on 127.0.0.1 (port and token in ~/.talkback/voiced.json). Requests are one JSON line with the token:
 {"cmd": "say", "text": ..., "session": ...}, {"cmd": "stop", "session": ...}, {"cmd": "ping"} or {"cmd": "quit"}.
 A new "say" interrupts whatever is playing; a "stop" without a session stops any speech. "ping" answers
-"pong <engine> <version>" so the plugin can replace a daemon left over from an older version.
+"pong <engine> <version> <player>" so the plugin can replace a daemon left over from an older version.
 
 Engines: MLX on Apple silicon (GPU), Kokoro ONNX on the CPU everywhere else (Linux, Windows, Intel Macs).
 On Linux and Windows the daemon also stops speech when a microphone turns on (macOS: talkback-helper).
@@ -104,27 +104,111 @@ def load_engine():
 
 # ---------- players ----------
 
+FAST_FAIL = 0.5  # a player that exits non-zero this soon after it starts is broken, not interrupted
+PLAYER_GRACE = 5  # seconds a player may run past its segment's length before it is killed
+
+
 class ProcPlayer:
-    def __init__(self, argv):
-        self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Plays one WAV with the first working command in `candidates` (a list shared by the whole daemon run).
+
+    A command that exits non-zero within FAST_FAIL seconds is logged once, with its stderr, and dropped for the
+    rest of this run when another one is left; the same segment then plays with the next. Each wait is limited
+    to the segment's length plus PLAYER_GRACE seconds.
+    """
+    reported = set()
+
+    def __init__(self, candidates, path, seconds):
+        self.candidates, self.path, self.seconds = candidates, path, seconds
+        self.proc = self.err = None
+        self.killed = False
+        self.started = 0.0
+        self.begin = time.time()
+        self.start()
+
+    def start(self):
+        while self.candidates:
+            name, argv = self.candidates[0]
+            self.close_err()
+            self.err = tempfile.TemporaryFile()
+            try:
+                self.proc = subprocess.Popen(argv + [self.path], stdout=subprocess.DEVNULL, stderr=self.err)
+                self.started = time.time()
+                if self.killed:  # stopped while this one was starting
+                    self.proc.kill()
+                return
+            except OSError as e:
+                self.report(name, f"could not start: {e}", drop=True)
+        self.proc = None
+
+    def report(self, name, why, drop):
+        if name not in self.reported:
+            self.reported.add(name)
+            log(f"audio player {name}: {why}")
+        if drop and len(self.candidates) > 1:
+            self.candidates[:] = [c for c in self.candidates if c[0] != name]
+
+    def stderr_text(self):
+        try:
+            self.err.seek(0)
+            return self.err.read(2000).decode("utf-8", "replace").strip()
+        except (OSError, ValueError):
+            return ""
+
+    def close_err(self):
+        if self.err:
+            self.err.close()
+            self.err = None
 
     def wait(self):
-        self.proc.wait()
+        try:
+            self.wait_for_player()
+        finally:
+            self.close_err()
+            if self.killed and self.proc:  # reap it, so a stopped reply leaves no zombie
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    def wait_for_player(self):
+        while self.proc and not self.killed:
+            name = self.candidates[0][0]
+            try:
+                rc = self.proc.wait(timeout=max(0.1, self.begin + self.seconds + PLAYER_GRACE - time.time()))
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+                self.report(name, "did not finish in time; killed", drop=False)
+                return
+            if rc == 0 or self.killed:
+                return
+            quick = time.time() - self.started < FAST_FAIL
+            err = self.stderr_text()
+            self.report(name, f"exited with {rc}" + (f": {err}" if err else ""), drop=quick)
+            if not quick or self.candidates[0][0] == name:
+                return  # a late failure, or nothing left to try, is not retried
+            self.start()
 
     def kill(self):
-        if self.proc.poll() is None:
+        self.killed = True
+        if self.proc and self.proc.poll() is None:
             self.proc.kill()
 
 
 class WinPlayer:
-    """winsound plays one WAV asynchronously; we track its length to know when it ends."""
+    """winsound plays one WAV asynchronously; we track its length to know when it ends.
+
+    The next PlaySound cuts the previous sound, so a start delay would clip the end of a segment: wait a little
+    longer than the WAV is long.
+    """
+    TAIL = 0.25
 
     def __init__(self, path, seconds):
         import winsound
         self.winsound = winsound
-        self.end = time.time() + seconds
+        self.end = time.time() + seconds + self.TAIL
         self.killed = False
-        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
 
     def wait(self):
         while not self.killed and time.time() < self.end:
@@ -132,7 +216,7 @@ class WinPlayer:
 
     def kill(self):
         self.killed = True
-        self.winsound.PlaySound(None, 0)
+        self.winsound.PlaySound(None, self.winsound.SND_PURGE)
 
 
 class NullPlayer:
@@ -146,23 +230,27 @@ class NullPlayer:
         pass
 
 
+LINUX_PLAYERS = {
+    "pw-play": ["pw-play"], "paplay": ["paplay"], "aplay": ["aplay", "-q"],
+    "ffplay": ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"],
+}
+
+
 def player_factory():
+    """(make_player, name): name() is the player in use now; it can change after a fallback."""
     choice = os.environ.get("TALKBACK_PLAYER", "")
     if choice == "none":
-        return NullPlayer
+        return NullPlayer, lambda: "none"
     if sys.platform == "win32":
-        return WinPlayer
+        return WinPlayer, lambda: "winsound"
     if sys.platform == "darwin":
-        return lambda path, seconds: ProcPlayer(["afplay", path])
-    candidates = {
-        "pw-play": ["pw-play"], "paplay": ["paplay"], "aplay": ["aplay", "-q"],
-        "ffplay": ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"],
-    }
-    for name, argv in candidates.items():
-        if (not choice or choice == name) and shutil.which(name):
-            return lambda path, seconds, argv=argv: ProcPlayer(argv + [path])
-    log("no audio player found (install pipewire, pulseaudio-utils, alsa-utils or ffmpeg); staying silent")
-    return NullPlayer
+        candidates = [("afplay", ["afplay"])]
+    else:
+        candidates = [(n, a) for n, a in LINUX_PLAYERS.items() if (not choice or choice == n) and shutil.which(n)]
+    if not candidates:
+        log("no audio player found (install pipewire, pulseaudio-utils, alsa-utils or ffmpeg); staying silent")
+        return NullPlayer, lambda: "none"
+    return (lambda path, seconds: ProcPlayer(candidates, path, seconds)), lambda: candidates[0][0]
 
 
 # ---------- microphone (Linux, Windows) ----------
@@ -216,12 +304,24 @@ def mic_probe():
 # ---------- daemon ----------
 
 engine = load_engine()
-make_player = player_factory()
+make_player, player_name = player_factory()
 lock = threading.Lock()
 speak_lock = threading.Lock()  # one synthesis at a time: a new reply waits for the old one to notice it was stopped
 current = {"gen": 0, "session": None, "player": None}
 last_used = time.time()
 token = secrets.token_hex(16)
+
+
+def replace_retry(src, dst, tries=5, delay=0.05):
+    """os.replace, retried on Windows, where it fails with PermissionError while a reader has dst open."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
 
 
 def config():
@@ -243,10 +343,15 @@ def stop(session=None):
 
 
 def speak(text, session):
-    stop()
+    # Stopping the old reply and claiming a generation for this one is a single step: of two says that arrive
+    # together only the later keeps its generation, so the earlier one never speaks.
     with lock:
+        current["gen"] += 1
         gen = current["gen"]
         current["session"] = session
+        player = current["player"]
+    if player:
+        player.kill()
     with speak_lock:
         if gen == current["gen"]:  # not stopped or replaced while waiting for the previous reply to wind down
             speak_locked(text, gen)
@@ -264,9 +369,9 @@ def speak_locked(text, gen):
             sf.write(path, audio, SAMPLE_RATE)
             if player:
                 player.wait()
-            if gen != current["gen"]:
-                return
             with lock:
+                if gen != current["gen"]:  # stopped since the check above: no further segment may start
+                    return
                 player = current["player"] = make_player(path, len(audio) / SAMPLE_RATE)
         if player:
             player.wait()
@@ -300,7 +405,7 @@ def handle(conn):
             stop(req.get("session"))
             conn.sendall(b"ok\n")
         elif cmd == "ping":
-            conn.sendall(f"pong {engine.name} {VERSION}\n".encode())
+            conn.sendall(f"pong {engine.name} {VERSION} {player_name()}\n".encode())
         elif cmd == "quit":
             stop()
             conn.sendall(b"ok\n")
@@ -357,7 +462,7 @@ def main():
         json.dump({"port": srv.getsockname()[1], "token": token, "pid": os.getpid()}, f)
     if os.name == "posix":
         os.chmod(tmp, 0o600)
-    os.replace(tmp, ENDPOINT)
+    replace_retry(tmp, ENDPOINT)
     log(f"ready: engine={engine.name} version={VERSION} port={srv.getsockname()[1]}")
     probe = mic_probe()
     if probe:
