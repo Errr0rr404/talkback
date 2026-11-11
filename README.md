@@ -1,6 +1,6 @@
 # talkback
 
-Claude Code reads its replies aloud in a natural voice ([Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)) that runs on your own machine. Works on macOS, Linux and Windows.
+Claude Code reads its replies aloud in a natural voice ([Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)) that runs on your own machine. Works on macOS, Linux and Windows (Windows needs [Git for Windows](https://git-scm.com/download/win)).
 
 ## Install
 

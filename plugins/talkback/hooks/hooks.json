@@ -5,12 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/bin/run.sh",
-              "hook",
-              "stop"
-            ],
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/run.sh\" hook stop",
             "timeout": 10
           }
         ]
@@ -21,12 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/bin/run.sh",
-              "hook",
-              "prompt"
-            ],
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/run.sh\" hook prompt",
             "timeout": 5
           }
         ]
@@ -37,12 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/bin/run.sh",
-              "hook",
-              "session-start"
-            ],
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/run.sh\" hook session-start",
             "timeout": 10
           }
         ]

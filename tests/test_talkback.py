@@ -940,8 +940,81 @@ class LauncherTest(unittest.TestCase):
             hooks = json.load(f)["hooks"]
         for groups in hooks.values():
             for h in groups[0]["hooks"]:
-                self.assertEqual(h["command"], "sh")
-                self.assertTrue(h["args"][0].endswith("bin/run.sh"))
+                # Shell form, no "args": Claude Code runs it in Git Bash on Windows, where plain `sh` may not be on PATH.
+                self.assertNotIn("args", h)
+                self.assertRegex(h["command"], r'^sh "\$\{CLAUDE_PLUGIN_ROOT\}/bin/run\.sh" hook [a-z-]+$')
+
+    def test_hook_commands_run_from_a_plugin_path_with_a_space(self):
+        with open(os.path.join(ROOT, "plugins", "talkback", "hooks", "hooks.json")) as f:
+            hooks = json.load(f)["hooks"]
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = os.path.join(tmp, "talk back")
+            shutil.copytree(os.path.join(ROOT, "plugins", "talkback", "bin"), os.path.join(plugin, "bin"),
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            bin_dir = os.path.join(tmp, "path")
+            os.makedirs(bin_dir)
+            marker = os.path.join(tmp, "args")
+            with open(os.path.join(bin_dir, "python3"), "w") as f:
+                f.write('#!/bin/sh\n[ "$1" = "-c" ] && exit 0\nprintf "%s\\n" "$@" >> "$MARKER"\n')
+            os.chmod(os.path.join(bin_dir, "python3"), 0o755)
+            env = {"HOME": tmp, "PATH": bin_dir + ":/usr/bin:/bin", "TALKBACK_HOME": os.path.join(tmp, "tb"),
+                   "CLAUDE_PLUGIN_ROOT": plugin, "MARKER": marker}
+            if shutil.which("uv"):
+                self.skipTest("a real uv would run talkback.py instead of the fake python3")
+            for ev, groups in hooks.items():
+                r = subprocess.run(groups[0]["hooks"][0]["command"], shell=True, env=env, capture_output=True,
+                                   text=True, timeout=20, stdin=subprocess.DEVNULL, check=False)
+                self.assertEqual(r.returncode, 0, r.stderr)
+            with open(marker) as f:
+                lines = f.read().splitlines()
+            self.assertEqual(lines.count(os.path.join(plugin, "bin", "talkback.py")), 3)
+
+    def test_uv_installer_gets_its_settings(self):
+        src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
+        with tempfile.TemporaryDirectory() as home:
+            bin_dir = os.path.join(home, "bin")
+            os.makedirs(bin_dir)
+            with open(os.path.join(bin_dir, "curl"), "w") as f:
+                f.write('#!/bin/sh\necho \'echo "$UV_UNMANAGED_INSTALL|$UV_NO_MODIFY_PATH"\'\n')
+            os.chmod(os.path.join(bin_dir, "curl"), 0o755)
+            state = os.path.join(home, "tb")
+            env = {"HOME": home, "PATH": bin_dir + ":/usr/bin:/bin", "TALKBACK_HOME": state}
+            subprocess.run(["/bin/sh", src, "_uv_install"], env=env, capture_output=True, text=True, timeout=20,
+                           stdin=subprocess.DEVNULL, check=False)
+            with open(os.path.join(state, "uv-install.log")) as f:
+                self.assertEqual(f.read().strip(), state + "/uv|1")
+
+    @unittest.skipUnless(shutil.which("uv"), "uv is not installed")
+    def test_project_python_pin_and_uv_toml_do_not_break_the_launcher(self):
+        src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(proj, ".python-version"), "w") as f:
+                f.write("3.9.1\n")
+            with open(os.path.join(proj, "uv.toml"), "w") as f:
+                f.write('required-version = "==0.1.0"\n')
+            env = dict(os.environ, HOME=home, TALKBACK_HOME=os.path.join(home, "tb"), UV_PYTHON_DOWNLOADS="never")
+            r = subprocess.run(["/bin/sh", src, "status"], cwd=proj, env=env, capture_output=True, text=True,
+                               timeout=60, stdin=subprocess.DEVNULL, check=False)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("talkback", r.stdout.lower())
+
+
+class RepoFilesTest(unittest.TestCase):
+    def test_gitattributes_keeps_lf_in_shell_files(self):
+        if not shutil.which("git"):
+            self.skipTest("git is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            shutil.copytree(ROOT, src, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=true"]
+            subprocess.run(git + ["init", "-q", src], check=True, capture_output=True)
+            subprocess.run(git + ["-C", src, "add", "-A"], check=True, capture_output=True)
+            subprocess.run(git + ["-C", src, "commit", "-qm", "x"], check=True, capture_output=True)
+            dst = os.path.join(tmp, "dst")
+            subprocess.run(git + ["clone", "-q", src, dst], check=True, capture_output=True)
+            for rel in ("plugins/talkback/bin/run.sh", "plugins/talkback/commands/talkback.md"):
+                with open(os.path.join(dst, rel), "rb") as f:
+                    self.assertNotIn(b"\r", f.read(), rel)
 
 
 class SessionLifecycleTest(TalkbackTest):

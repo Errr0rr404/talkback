@@ -106,14 +106,14 @@ rm -rf ~/.talkback
 ## Shell use
 
 ```sh
-npm test 2>&1 | tail -3 | uv run --no-project python <plugin>/bin/talkback.py speak
+npm test 2>&1 | tail -3 | uv run --no-config --no-project python <plugin>/bin/talkback.py speak
 ```
 
 ## Development
 
 ```sh
 git clone https://github.com/Errr0rr404/talkback && cd talkback
-python3 -m unittest discover -s tests  # or: uv run --no-project python -m unittest discover -s tests
+python3 -m unittest discover -s tests  # or: uv run --no-config --no-project python -m unittest discover -s tests
 claude plugin marketplace add "$PWD" && claude plugin install talkback@talkback
 ```
 

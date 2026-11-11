@@ -39,8 +39,7 @@ if [ "$1" = "_uv_install" ]; then
   fi
   mkdir -p "$state"
   printf '{"since":%s}\n' "$(date +%s)" >"$state/uv-starting.json"
-  UV_UNMANAGED_INSTALL="$state/uv" UV_NO_MODIFY_PATH=1 \
-    curl -LsSf https://astral.sh/uv/install.sh | sh >"$state/uv-install.log" 2>&1
+  curl -LsSf https://astral.sh/uv/install.sh | UV_UNMANAGED_INSTALL="$state/uv" UV_NO_MODIFY_PATH=1 sh >"$state/uv-install.log" 2>&1
   if [ -x "$state/uv/uv" ] || [ -x "$state/uv/uv.exe" ]; then
     rm -f "$state/uv-failed"
   else
@@ -57,7 +56,7 @@ if [ -z "$uv" ]; then
   done
 fi
 if [ -n "$uv" ]; then
-  exec "$uv" run --no-project --quiet python "$py" "$@"
+  exec "$uv" run --no-config --no-project --quiet python "$py" "$@"
 fi
 
 # No uv yet: talkback.py is standard-library only, so any Python 3.8+ can run it (it installs uv itself).
