@@ -38,10 +38,10 @@ The words after `/talkback` are passed to talkback through a quoted heredoc, nev
 
 ## Talking to Claude
 
-talkback does the listening part. To talk, use either:
+talkback only reads replies aloud. To talk to Claude, use either (Hex is optional; replies are read aloud without it):
 
-- **Claude Code's `/voice`** (built in, needs a claude.ai login). Run `/voice tap`, then tap Space, speak, tap Space: your message sends itself. It doesn't work with Amazon Bedrock, Google Cloud, Microsoft Foundry, an API key or a company gateway.
-- **[Hex](https://github.com/kitlangton/Hex)** for those logins, or to keep your voice on your machine. On macOS, talkback presses Enter for you when you release Hex's hotkey (Terminal and iTerm2).
+- **Claude Code's `/voice`** (built in, for claude.ai logins, nothing to install). Run `/voice tap`, then tap Space, speak, tap Space: your message sends itself. It doesn't work with Amazon Bedrock, Google Cloud, Microsoft Foundry, an API key or a company gateway.
+- **[Hex](https://github.com/kitlangton/Hex)** if `/voice` isn't available to you, or to keep your voice on your machine. On macOS, talkback presses Enter for you when you release Hex's hotkey (Terminal and iTerm2).
 
 Hex is a macOS app that needs your Microphone and Accessibility permissions, so talkback never installs it behind your back. `/talkback setup` explains what it will do; `/talkback setup yes` downloads Hex's latest release into `/Applications` and opens the two permission panes; `/talkback setup skip` declines. Nothing happens on Linux and Windows.
 

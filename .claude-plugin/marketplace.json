@@ -8,9 +8,9 @@
     {
       "name": "talkback",
       "source": "./plugins/talkback",
-      "version": "0.4.3",
-      "description": "Hear Claude Code's replies in a local Kokoro voice; talk back with Hex, with auto-Enter and press-to-interrupt."
+      "version": "0.4.4",
+      "description": "Hear Claude Code's replies in a natural voice that runs on your machine. Optional: talk back with /voice, or with Hex on macOS."
     }
   ],
-  "description": "talkback: hear Claude Code's replies in a local Kokoro voice and talk back with Hex."
+  "description": "talkback: hear Claude Code's replies aloud. Talk back with /voice, or with Hex on macOS."
 }
