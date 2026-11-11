@@ -5,6 +5,15 @@ here=${0%/*}
 py="$here/talkback.py"
 state="${TALKBACK_HOME:-$HOME/.talkback}"
 
+# /talkback's words arrive on stdin. Save them before anything else reads stdin, and pass a path
+# so the shell never word-splits, expands, or redirects them.
+if [ "$1" = "--from-stdin" ]; then
+  shift
+  args_file=$(mktemp "${TMPDIR:-/tmp}/talkback-args.XXXXXX") || exit 1
+  cat > "$args_file" || { rm -f "$args_file"; exit 1; }
+  set -- --args-file "$args_file" "$@"
+fi
+
 uv=$(command -v uv 2>/dev/null)
 if [ -z "$uv" ]; then
   for c in "$state/uv/uv" "$state/uv/uv.exe" "$HOME/.local/bin/uv" "$HOME/.local/bin/uv.exe" \
@@ -31,4 +40,8 @@ if [ "$1" = "hook" ] && [ "$2" = "session-start" ] && command -v curl >/dev/null
   exit 0
 fi
 [ "$1" = "hook" ] && exit 0
+# Nothing will read the saved words. Remove them before telling the user to retry.
+if [ "$1" = "--args-file" ] && [ -n "$2" ]; then
+  rm -f "$2"
+fi
 echo "talkback is installing uv in the background; try again in a minute. If that doesn't help, install uv: https://docs.astral.sh/uv/getting-started/installation/"
