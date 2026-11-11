@@ -2,7 +2,7 @@
 
 Hear Claude Code read its replies aloud, in a natural voice ([Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)) that runs on your own machine. macOS, Linux and Windows.
 
-- Code, tables and long paths are skipped; long replies are trimmed.
+- Code, tables and long paths are skipped; long replies are trimmed, and a line says the rest was trimmed.
 - Speech stops as soon as you start talking or send a message.
 
 ## Install
