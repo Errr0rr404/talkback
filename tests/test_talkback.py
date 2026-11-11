@@ -6,7 +6,9 @@ import importlib
 import io
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -145,6 +147,69 @@ class CommandTest(TalkbackTest):
             self.assertIn("default=off", out)
             self.assertIn("engine=", out)
 
+    def test_say_does_not_write_skipnext_without_a_valid_session(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "../../etc"
+        leaked = os.path.normpath(self.tb.session_file("../../etc", ".skipnext"))
+        try:
+            out = self.run_command("say", "hello")
+            self.assertIn("couldn't find this session", out)
+            self.assertEqual(self.said, [])
+            self.assertFalse(os.path.exists(leaked))
+        finally:
+            if os.path.exists(leaked):
+                os.remove(leaked)
+
+    def test_say_sets_skipnext_so_the_acknowledgement_is_not_spoken(self):
+        out = self.run_command("say", "hello", "there")
+        self.assertIn("Speaking.", out)
+        self.assertEqual(self.said, [("hello there.", "test-session")])
+        skip = self.tb.session_file("test-session", ".skipnext")
+        self.assertTrue(os.path.exists(skip))
+        self.tb.set_session("test-session", "on")
+        self.run_hook("stop", {"session_id": "test-session", "last_assistant_message": "Speaking."})
+        self.assertEqual(self.said, [("hello there.", "test-session")])
+        self.assertFalse(os.path.exists(skip))
+
+    def test_args_file_is_spoken_literally(self):
+        path = os.path.join(self.home.name, "args.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("say it's ready; echo $(HOME)\n")
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["talkback.py", "--args-file", path]), redirect_stdout(out):
+            self.tb.main()
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(self.said, [("it's ready; echo $(HOME).", "test-session")])
+        self.assertIn("Speaking.", out.getvalue())
+        self.assertTrue(os.path.exists(self.tb.session_file("test-session", ".skipnext")))
+
+    def test_args_file_words_cannot_reach_internal_subcommands(self):
+        sentinel = os.path.join(self.home.name, "do-not-read.txt")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write("secret")
+        calls = []
+        self.tb.hook = lambda event: calls.append(("hook", event))
+        self.tb.ensure_uv = lambda: calls.append("ensure_uv")
+        self.tb.ensure_helper = lambda: calls.append("ensure_helper")
+        self.tb.ensure_daemon = lambda: calls.append("ensure_daemon") or False
+        self.tb.send = lambda *a, **k: calls.append("send")
+        for line in (
+            "_say test-session " + sentinel,
+            "hook session-start",
+            "_warm",
+        ):
+            path = os.path.join(self.home.name, "args.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(line + "\n")
+            out = io.StringIO()
+            with mock.patch.object(sys, "argv", ["talkback.py", "--args-file", path]), redirect_stdout(out):
+                self.tb.main()
+            self.assertFalse(os.path.exists(path), line)
+            self.assertIn("Usage", out.getvalue(), line)
+            self.assertEqual(self.said, [], line)
+        self.assertEqual(calls, [])
+        with open(sentinel, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "secret")
+
 
 class HookTest(TalkbackTest):
     def test_stop_speaks_only_when_on(self):
@@ -189,10 +254,22 @@ class HookTest(TalkbackTest):
         with mock.patch.object(self.tb, "send", side_effect=OSError("not running")):
             self.run_hook("prompt", {"session_id": "test-session"})
 
+    def test_prompt_clears_stale_skipnext(self):
+        os.makedirs(self.tb.SESSIONS)
+        skip = self.tb.session_file("test-session", ".skipnext")
+        open(skip, "w").close()
+        self.tb.set_session("test-session", "on")
+        with mock.patch.object(self.tb, "send", side_effect=OSError):
+            self.run_hook("prompt", {"session_id": "test-session", "prompt": "go on"})
+        self.assertFalse(os.path.exists(skip))
+        self.run_hook("stop", {"session_id": "test-session", "last_assistant_message": "Next reply."})
+        self.assertEqual(self.said, [("Next reply.", "test-session")])
+
 
 class InstallStatusTest(TalkbackTest):
     def setUp(self):
         super().setUp()
+        # engine_status() reports "waiting for uv" before Kokoro when find_uv() is empty.
         patcher = mock.patch.object(self.tb, "find_uv", return_value="/usr/bin/uv")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -465,6 +542,95 @@ class HexSetupTest(TalkbackTest):
         self.assertEqual(cmds, ["attach", "detach"])
 
 
+class ArgumentSafetyTest(unittest.TestCase):
+    """/talkback must not let the shell parse the user's words."""
+
+    def command_script(self):
+        path = os.path.join(ROOT, "plugins", "talkback", "commands", "talkback.md")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(text.count("$ARGUMENTS"), 1)
+        # Claude Code (2.1.318) refuses `exec` in a command's shell block, so the guard against a line
+        # that closes the heredoc early is the permission rule: it allows only run.sh --from-stdin, and
+        # any other command the words smuggle in after that line needs the user's approval.
+        prefix = 'sh "${CLAUDE_PLUGIN_ROOT}/bin/run.sh" --from-stdin'
+        self.assertIn("\nallowed-tools: Bash(" + prefix + ":*)\n", text)
+        match = re.search(r"^```!\n(.*)^```\s*$", text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        script = match.group(1)
+        self.assertEqual(script.splitlines()[0], prefix + " <<'TALKBACK_EOF'")
+        return script
+
+    def test_shell_command_passes_text_literally(self):
+        script = self.command_script()
+        with tempfile.TemporaryDirectory() as root:
+            bindir = os.path.join(root, "bin")
+            os.makedirs(bindir)
+            capture = os.path.join(root, "capture")
+            stub = os.path.join(bindir, "run.sh")
+            with open(stub, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE.argv\"\ncat > \"$CAPTURE.stdin\"\n")
+            os.chmod(stub, 0o755)
+            env = dict(os.environ, CLAUDE_PLUGIN_ROOT=root, CAPTURE=capture,
+                       HOME="/talkback-home-should-not-expand")
+            payloads = [
+                "say it's ready",
+                "say cost is $HOME",
+                "say hello > " + os.path.join(root, "pwned"),
+                "say $(touch " + os.path.join(root, "pwned") + ")",
+                "say hello; echo PWNED",
+                "say `touch " + os.path.join(root, "pwned") + "`",
+                'say hello"; touch ' + os.path.join(root, "pwned") + '; echo "',
+            ]
+            for payload in payloads:
+                marker = os.path.join(root, "pwned")
+                proc = subprocess.run(["bash", "-c", script.replace("$ARGUMENTS", payload, 1)],
+                                      env=env, capture_output=True, text=True, timeout=20, check=False)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn("PWNED", proc.stdout)
+                self.assertFalse(os.path.exists(marker), payload)
+                with open(capture + ".argv", encoding="utf-8") as f:
+                    self.assertEqual(f.read().split(), ["--from-stdin"])
+                with open(capture + ".stdin", encoding="utf-8") as f:
+                    got = f.read()
+                self.assertNotIn("/talkback-home-should-not-expand", got)
+                self.assertEqual(got, payload + "\n")
+
+    def test_run_sh_forwards_stdin_without_parsing_it(self):
+        src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
+        with tempfile.TemporaryDirectory() as home:
+            bin_dir = os.path.join(home, "bin")
+            os.makedirs(bin_dir)
+            run_sh = os.path.join(home, "run.sh")
+            with open(src, encoding="utf-8") as f:
+                text = f.read().replace("/opt/homebrew/bin/uv /usr/local/bin/uv", "")
+            with open(run_sh, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.chmod(run_sh, 0o755)
+            py = os.path.join(bin_dir, "python3")
+            with open(py, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\n"
+                        "if [ \"$1\" = \"-c\" ]; then exit 0; fi\n"
+                        "prev=\n"
+                        "for a in \"$@\"; do\n"
+                        "  if [ \"$prev\" = \"--args-file\" ]; then cat \"$a\"; rm -f \"$a\"; exit 0; fi\n"
+                        "  prev=$a\n"
+                        "done\n"
+                        "echo missing-args-file >&2\nexit 1\n")
+            os.chmod(py, 0o755)
+            for tool in ("mktemp", "cat", "rm"):
+                os.symlink(shutil.which(tool), os.path.join(bin_dir, tool))
+            # talkback.py must sit next to run.sh; the stub python ignores its contents.
+            open(os.path.join(home, "talkback.py"), "w").close()
+            payload = "say it's ready; echo $(HOME) > /tmp/talkback-should-not-exist\n"
+            env = {"HOME": home, "PATH": bin_dir, "TALKBACK_HOME": os.path.join(home, "tb")}
+            proc = subprocess.run(["/bin/sh", run_sh, "--from-stdin"], env=env, input=payload,
+                                  capture_output=True, text=True, timeout=20, check=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, payload)
+            self.assertFalse(os.path.exists("/tmp/talkback-should-not-exist"))
+
+
 class LauncherTest(unittest.TestCase):
     """bin/run.sh with no uv and no Python on PATH must not fail a hook."""
 
@@ -486,6 +652,29 @@ class LauncherTest(unittest.TestCase):
             r = subprocess.run(["/bin/sh", run_sh, "status"], env=env, capture_output=True, text=True, timeout=20,
                                stdin=subprocess.DEVNULL, check=False)
             self.assertIn("installing uv", r.stdout)
+
+    def test_no_runtime_removes_the_argument_file(self):
+        src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
+        with tempfile.TemporaryDirectory() as home:
+            run_sh = os.path.join(home, "run.sh")
+            with open(src, encoding="utf-8") as f:
+                text = f.read().replace("/opt/homebrew/bin/uv /usr/local/bin/uv", "")
+            with open(run_sh, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.chmod(run_sh, 0o755)
+            bin_dir = os.path.join(home, "bin")
+            os.makedirs(bin_dir)
+            for tool in ("mktemp", "cat", "rm"):
+                os.symlink(shutil.which(tool), os.path.join(bin_dir, tool))
+            tmp = os.path.join(home, "tmp")
+            os.makedirs(tmp)
+            env = {"HOME": home, "PATH": bin_dir, "TALKBACK_HOME": os.path.join(home, "tb"), "TMPDIR": tmp}
+            proc = subprocess.run(["/bin/sh", run_sh, "--from-stdin"], env=env,
+                                  input="say hello; echo should-not-run\n",
+                                  capture_output=True, text=True, timeout=20, check=False)
+            self.assertIn("installing uv", proc.stdout)
+            self.assertNotIn("should-not-run", proc.stdout)
+            self.assertEqual(os.listdir(tmp), [])
 
     def test_hooks_json_uses_the_launcher(self):
         with open(os.path.join(ROOT, "plugins", "talkback", "hooks", "hooks.json")) as f:
