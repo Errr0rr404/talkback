@@ -48,6 +48,7 @@ UV_DOCS = "https://docs.astral.sh/uv/getting-started/installation/"
 HEX_OFFERED = os.path.join(STATE, "hex-offered")  # the first-run mention of /talkback setup was shown
 HEX_REPO = "kitlangton/Hex"
 MAX_CHARS = 700
+TRIM_NOTE = "The rest was trimmed."  # spoken when code, a table, or the length limit drops something
 SESSION_TTL = 14 * 24 * 3600  # on/off switches of sessions untouched this long are pruned
 VOICES = {  # Kokoro v1.0 English voices: first letter a = American, b = British
     "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore", "af_nicole", "af_nova", "af_river",
@@ -144,6 +145,7 @@ def ping():
         return None
     if not parts or parts[0] != "pong":
         return None
+    remove(START_FAILED)  # it answered, so a start that timed out earlier is no longer the latest word
     return (parts[1] if len(parts) > 1 else "?", parts[2] if len(parts) > 2 else "?")
 
 
@@ -350,6 +352,7 @@ def ensure_daemon(wait=900):
     if daemon_alive():
         if not os.path.exists(INSTALLED):  # installed before this marker existed
             open(INSTALLED, "w").close()
+        remove(START_FAILED)
         return True
     uv = find_uv()
     if not uv:
@@ -357,6 +360,7 @@ def ensure_daemon(wait=900):
     os.makedirs(STATE, exist_ok=True)
     with FileLock(DAEMON_LOCK):  # one starter at a time; the rest then find it alive
         if daemon_alive():
+            remove(START_FAILED)
             return True
         with open(STARTING, "w") as f:
             json.dump({"since": time.time(), "first": not os.path.exists(INSTALLED)}, f)
@@ -372,6 +376,32 @@ def ensure_daemon(wait=900):
         return ok
 
 
+def stop_spawned(proc):
+    """Stop a child from spawn_detached, and the process group it leads (uv's python grandchild)."""
+    if proc.poll() is not None:
+        return
+    if IS_WIN:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if proc.poll() is None:
+            proc.kill()
+        return
+    # start_new_session makes proc.pid the process-group id, so this reaches grandchildren too.
+    for sig in (15, 9):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                return
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def start_daemon(uv, wait):
     env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE, PYTHONUNBUFFERED="1",
                TALKBACK_VERSION=plugin_version())
@@ -384,6 +414,9 @@ def start_daemon(uv, wait):
         if daemon_alive():
             return True
         time.sleep(0.5)
+    if daemon_alive():  # came up as the clock ran out: keep it, don't start a second one later
+        return True
+    stop_spawned(proc)  # otherwise the late child stays up and a retry launches another
     return False
 
 
@@ -520,13 +553,27 @@ def last_reply(transcript_path, tail=4 << 20):
 
 
 def speakable(md, limit=MAX_CHARS):
-    """Markdown reply -> plain sentences worth hearing; limit=0 keeps all of it."""
-    t = re.sub(r"```.*?```", " ", md, flags=re.DOTALL)            # code blocks
-    t = re.sub(r"^\s*\|.*\|\s*$", " ", t, flags=re.MULTILINE)      # tables
+    """Markdown reply -> plain sentences worth hearing; limit=0 keeps all of it.
+
+    Fenced code (backticks or tildes), table rows, long inline code, and anything past limit are
+    dropped. When that removes something, one sentence says so, so a listener can tell.
+    """
+    dropped = False
+
+    def drop(text, pattern, repl=" ", flags=0):
+        nonlocal dropped
+        new = re.sub(pattern, repl, text, flags=flags)
+        if new != text:
+            dropped = True
+        return new
+
+    t = drop(md, r"```.*?```", flags=re.DOTALL)                    # backtick fences
+    t = drop(t, r"~~~.*?~~~", flags=re.DOTALL)                     # tilde fences
+    t = drop(t, r"^\s*\|.*\|\s*$", flags=re.MULTILINE)                # tables
     t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)               # links -> label
     t = re.sub(r"https?://\S+", "a link", t)
     t = re.sub(r"`([^`]{1,40})`", r"\1", t)                        # short inline code: keep
-    t = re.sub(r"`[^`]*`", "", t)                                  # long inline code: drop
+    t = drop(t, r"`[^`]*`", repl="")                               # long inline code: drop
     t = re.sub(r"~?/?(?:[\w.-]+/){2,}([\w.-]+)", r"\1", t)        # paths -> basename
     t = re.sub(r"(?:[A-Za-z]:)?\\?(?:[\w.-]+\\){2,}([\w.-]+)", r"\1", t)  # Windows paths too
     t = re.sub(r"^\s*#+\s*", "", t, flags=re.MULTILINE)           # headings
@@ -536,14 +583,19 @@ def speakable(md, limit=MAX_CHARS):
     t = re.sub(r"\s*(?:->|→)\s*", " to ", t)
     paras = [re.sub(r"\s+", " ", p).strip() for p in re.split(r"\n\s*\n", t)]
     out = ""
+    cut = False
     for p in filter(None, paras):
         if limit and out and len(out) + len(p) > limit:
+            cut = True
             break
         out += (" " if out else "") + (p if p[-1] in ".!?:" else p + ".")
     if limit and len(out) > limit:
-        cut = out[:limit]
-        end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
-        out = cut[: end + 1] if end > 0 else cut
+        cut = True
+        cut_at = out[:limit]
+        end = max(cut_at.rfind(". "), cut_at.rfind("? "), cut_at.rfind("! "))
+        out = cut_at[: end + 1] if end > 0 else cut_at
+    if dropped or cut:
+        out = (out + " " + TRIM_NOTE).strip()
     return out
 
 
