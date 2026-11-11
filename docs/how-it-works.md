@@ -17,6 +17,34 @@
 
 The voice always runs on your machine. Claude Code's `/voice` sends your audio to Anthropic for transcription; Hex keeps it local.
 
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/talkback on` / `off` | Turn spoken replies on or off for this session (`/talkback` alone toggles) |
+| `/talkback status` | Show settings and whether the voice is ready; says what's missing if a download failed |
+| `/talkback full` | Read the last reply again, in full |
+| `/talkback length full` | Always read whole replies (`full`, `all` or `0`; `length 700` to trim again) |
+| `/talkback voice bf_emma` | Change the [voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md) (default `af_heart`) |
+| `/talkback speed 1.3` | Speaking speed, 0.5 to 2 (default 1.1) |
+| `/talkback default on` | Turn it on in every new session |
+| `/talkback autoenter off` | Stop pressing Enter after Hex |
+| `/talkback say hello` | Speak any text |
+| `/talkback setup` | macOS: offer to install Hex and open its permission panes (`setup yes` to go ahead, `setup skip` to decline) |
+
+What gets read: code blocks, tables and long inline code are skipped, links become their label and long paths their file name. Replies past the length limit (700 characters by default) are trimmed. When anything is skipped or trimmed, speech ends with "The rest was trimmed."
+
+The words after `/talkback` are passed to talkback through a quoted heredoc, never through a shell parse, so quotes, `$HOME` or `$(...)` in `/talkback say` are spoken as written. The command's `allowed-tools` permits only `sh "${CLAUDE_PLUGIN_ROOT}/bin/run.sh" --from-stdin`.
+
+## Talking to Claude
+
+talkback does the listening part. To talk, use either:
+
+- **Claude Code's `/voice`** (built in, needs a claude.ai login). Run `/voice tap`, then tap Space, speak, tap Space: your message sends itself. It doesn't work with Amazon Bedrock, Google Cloud, Microsoft Foundry, an API key or a company gateway.
+- **[Hex](https://github.com/kitlangton/Hex)** for those logins, or to keep your voice on your machine. On macOS, talkback presses Enter for you when you release Hex's hotkey (Terminal and iTerm2).
+
+Hex is a macOS app that needs your Microphone and Accessibility permissions, so talkback never installs it behind your back. `/talkback setup` explains what it will do; `/talkback setup yes` downloads Hex's latest release into `/Applications` and opens the two permission panes; `/talkback setup skip` declines. Nothing happens on Linux and Windows.
+
 ## What works where
 
 | | macOS (Apple silicon) | macOS (Intel) | Linux | Windows |
@@ -34,7 +62,15 @@ The first `SessionStart` after the plugin install (or `/talkback on`) starts a b
 1. **uv.** Hooks run through `bin/run.sh`, which uses uv if it finds one (PATH, `~/.talkback/uv`, `~/.local/bin`, Homebrew, `~/.cargo/bin`), otherwise any Python 3.8+, otherwise (a session-start hook only) starts Astral's installer itself, holding `uv.lock` and leaving the same `uv-starting.json` / `uv-failed` markers. `talkback.py` then runs Astral's standalone installer (`curl ... install.sh | sh`, or the PowerShell script on Windows) with `UV_UNMANAGED_INSTALL=~/.talkback/uv` and `UV_NO_MODIFY_PATH=1`, so there's no `sudo`, no PATH or profile edit, and uv is used by absolute path. A failure leaves `~/.talkback/uv-failed` (retried by hooks after an hour, or at once by `/talkback on`) and `/talkback status` says what's missing.
 2. **Kokoro.** uv installs the Python libraries into `~/.talkback/venv`, and the service downloads the voice model: from Hugging Face on Apple silicon, from the kokoro-onnx GitHub release elsewhere.
 
-While that runs, `/talkback status` shows `installing uv` or `installing Kokoro`, and a reply that finishes early shows a note that it will be spoken once ready.
+What the first run puts on disk:
+
+| What | Size | Where it goes |
+|---|---|---|
+| [uv](https://docs.astral.sh/uv/), only if you don't have it (Astral's official installer; PATH and shell profile untouched) | about 20 MB | `~/.talkback/uv` |
+| Python libraries and the Kokoro voice | a few hundred MB | `~/.talkback/venv` and the model cache (`~/.talkback/models` or the Hugging Face cache) |
+| Hex (macOS only, optional, asked first) | about 15 MB | `/Applications` |
+
+Setup takes a minute or two, longer on a slow connection. While that runs, `/talkback status` shows `installing uv` or `installing Kokoro`, and a reply that finishes early shows a note that it will be spoken once ready.
 
 **Hex** is never installed from a hook. On macOS the first-run message mentions `/talkback setup`; `setup yes` downloads the `.dmg` from the latest release of kitlangton/Hex (it has no Homebrew cask), copies `Hex.app` to `/Applications`, and opens the Microphone and Accessibility panes.
 
@@ -49,6 +85,23 @@ While that runs, `/talkback status` shows `installing uv` or `installing Kokoro`
 - `voiced.json`: socket address and auth token for the running daemon.
 - `bin/`: macOS helper binary (`talkback-helper`).
 - `voiced.log` and `helper.log`: the logs.
+
+## Troubleshooting
+
+- **No sound:** run `/talkback status`. If it says `installing Kokoro`, wait. If it says `stopped`, see `~/.talkback/voiced.log`. If it says `running`, check your volume and try `/talkback say hello`.
+- **`status` says `needs uv`:** the automatic uv install failed (no internet, or no `curl`/`wget`); see `~/.talkback/uv-install.log`. Install uv yourself ([instructions](https://docs.astral.sh/uv/getting-started/installation/)), then restart Claude Code. `/talkback on` also tries the download again.
+- **Linux, no sound:** install an audio player (`pipewire`, `pulseaudio-utils` or `alsa-utils`).
+- **macOS, Enter isn't pressed after Hex:** give your terminal Accessibility permission (System Settings, Privacy & Security, Accessibility).
+
+## Uninstall
+
+```sh
+claude plugin uninstall talkback@talkback
+pkill -x talkback-helper   # macOS only
+rm -rf ~/.talkback
+```
+
+`~/.talkback` holds the settings, the Kokoro environment uv built and the uv talkback installed for itself, so removing it removes all of those. A uv you installed yourself (Homebrew, `~/.local/bin`, winget) is left in place, and so is Hex: drag Hex to the Trash if you don't want it. The background voice service quits by itself within an hour.
 
 ## Shell use
 
