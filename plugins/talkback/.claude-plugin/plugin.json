@@ -1,8 +1,8 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "talkback",
-  "version": "0.4.3",
-  "description": "Hear Claude Code's replies in a natural local voice (Kokoro-82M). Talk back with Hex: auto-Enter when you let go of the hotkey, and speech stops the moment you press it.",
+  "version": "0.4.4",
+  "description": "Hear Claude Code's replies in a natural voice that runs on your machine. Optional: talk back with /voice, or with Hex on macOS.",
   "author": {
     "name": "Zan",
     "url": "https://github.com/Errr0rr404"

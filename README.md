@@ -19,10 +19,10 @@ The first session sets up the voice in the background (a few hundred MB, no `sud
 
 ## Talk back
 
-- **Claude Code's `/voice`**: built in, needs a claude.ai login.
-- **[Hex](https://github.com/kitlangton/Hex)** (macOS): works with any login, keeps your voice on your machine, and talkback presses Enter when you let go of the hotkey. Run `/talkback setup` to install it.
+talkback only reads replies aloud. To speak to Claude:
 
-Speech stops as soon as you start talking or send a message.
+- **Signed in with claude.ai:** use Claude Code's built-in `/voice`. Nothing to install.
+- **API key, Bedrock, Vertex, Foundry or a gateway, or you want your voice to stay on your Mac:** `/talkback setup` installs [Hex](https://github.com/kitlangton/Hex) (free, macOS). talkback then presses Enter when you let go of the hotkey and stops speech when you press it.
 
 ## Commands
 
