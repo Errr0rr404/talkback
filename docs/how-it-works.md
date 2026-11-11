@@ -24,7 +24,7 @@ The voice always runs on your machine. Claude Code's `/voice` sends your audio t
 | `/talkback on` / `off` | Turn spoken replies on or off for this session (`/talkback` alone toggles) |
 | `/talkback status` | Show settings and whether the voice is ready; says what's missing if a download failed |
 | `/talkback full` | Read the last reply again, in full |
-| `/talkback length full` | Always read whole replies (`full`, `all` or `0`; `length 700` to trim again) |
+| `/talkback length 1500` | Read up to 1500 characters per reply. Also `60s` or `2m` (about that long at the current speed), `full` (`all`, `0`) for whole replies; `length` alone shows the setting |
 | `/talkback voice bf_emma` | Change the [voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md) (default `af_heart`) |
 | `/talkback speed 1.3` | Speaking speed, 0.5 to 2 (default 1.1) |
 | `/talkback default on` | Turn it on in every new session |
@@ -32,7 +32,7 @@ The voice always runs on your machine. Claude Code's `/voice` sends your audio t
 | `/talkback say hello` | Speak any text |
 | `/talkback setup` | macOS: offer to install Hex and open its permission panes (`setup yes` to go ahead, `setup skip` to decline) |
 
-What gets read: code blocks, tables and long inline code are skipped, links become their label and long paths their file name. Replies past the length limit (700 characters by default) are trimmed. When anything is skipped or trimmed, speech ends with "The rest was trimmed."
+What gets read: code blocks, tables and long inline code are skipped, links become their label and long paths their file name. Replies past the length limit (700 characters by default) are cut at a sentence end and speech ends with "The rest was trimmed."; the first time in a session, Claude Code also shows a note on how to change it. If only code or a table was left out, speech ends with "Code skipped."
 
 The words after `/talkback` are passed to talkback through a quoted heredoc, never through a shell parse, so quotes, `$HOME` or `$(...)` in `/talkback say` are spoken as written. The command's `allowed-tools` permits only `sh "${CLAUDE_PLUGIN_ROOT}/bin/run.sh" --from-stdin`.
 

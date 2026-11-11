@@ -53,7 +53,7 @@ class SpeakableTest(TalkbackTest):
     def test_strips_markdown_and_code(self):
         md = "## Done\n\nI set up **the hook** -> see [docs](https://x.y/z).\n\n```sh\necho hi\n```\n\n- First\n- Second"
         self.assertEqual(self.tb.speakable(md),
-                         "Done. I set up the hook to see docs. First. Second. " + self.tb.TRIM_NOTE)
+                         "Done. I set up the hook to see docs. First. Second. " + self.tb.SKIP_NOTE)
 
     def test_paths_become_file_names(self):
         self.assertEqual(self.tb.speakable("Edit ~/.claude/voice/hook.py now"), "Edit hook.py now.")
@@ -78,16 +78,78 @@ class SpeakableTest(TalkbackTest):
         tilde = "Look.\n\n~~~js\nconsole.log(1)\n~~~\n\nDone."
         spoken = self.tb.speakable(tilde)
         self.assertNotIn("console", spoken)
-        self.assertEqual(spoken, "Look. Done. " + self.tb.TRIM_NOTE)
+        self.assertEqual(spoken, "Look. Done. " + self.tb.SKIP_NOTE)
         table = "Rows.\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nEnd."
         table_spoken = self.tb.speakable(table)
         self.assertNotIn("|", table_spoken)
-        self.assertTrue(table_spoken.endswith(self.tb.TRIM_NOTE))
+        self.assertTrue(table_spoken.endswith(self.tb.SKIP_NOTE))
         self.assertIn("Rows.", table_spoken)
         self.assertEqual(self.tb.speakable("Nothing to cut."), "Nothing to cut.")
 
 
+    def test_short_first_paragraph_does_not_cost_the_answer(self):
+        md = "Sure.\n\n" + ("Word " * 135).strip() + ".\n\n" + "Tail sentence here."
+        spoken, cut = self.tb.speakable_parts(md, limit=700)
+        self.assertTrue(cut)
+        self.assertGreaterEqual(len(spoken), 600)
+        self.assertTrue(spoken.endswith(self.tb.TRIM_NOTE))
+        self.assertLessEqual(len(spoken), 700 + len(self.tb.TRIM_NOTE) + 1)
+
+    def test_cut_without_a_sentence_end_uses_the_last_space(self):
+        spoken = self.tb.speakable("word " * 100, limit=50)
+        body = spoken[: -(len(self.tb.TRIM_NOTE) + 1)]
+        self.assertLessEqual(len(body), 50)
+        self.assertTrue(body.endswith("word"))
+
+    def test_text_under_the_limit_is_unchanged(self):
+        self.assertEqual(self.tb.speakable_parts("Short one.\n\nAnother.", limit=700), ("Short one. Another.", False))
+
+    def test_notes_tell_a_code_skip_from_a_length_cut(self):
+        self.assertEqual(self.tb.speakable("Done.\n\n```sh\nls\n```"), "Done. " + self.tb.SKIP_NOTE)
+        long = "Done. " * 200 + "\n\n```sh\nls\n```"
+        spoken = self.tb.speakable(long, limit=100)
+        self.assertTrue(spoken.endswith(self.tb.TRIM_NOTE))
+        self.assertNotIn(self.tb.SKIP_NOTE, spoken)
+
+
 class CommandTest(TalkbackTest):
+    def test_bare_settings_show_the_current_value(self):
+        out = self.run_command("length")
+        self.assertIn("up to 700 characters (about 40 seconds at speed 1.1)", out)
+        self.assertIn("/talkback length full", out)
+        self.assertIn("/talkback full", out)
+        self.assertEqual(self.tb.load_config(), {})
+        self.assertIn("Voice is af_heart", self.run_command("voice"))
+        self.assertIn("Speed is 1.1", self.run_command("speed"))
+        self.assertIn("Auto-Enter after Hex dictation is on", self.run_command("autoenter"))
+        self.assertIn("off by default", self.run_command("default"))
+        self.run_command("length", "full")
+        self.run_command("voice", "bf_emma")
+        self.run_command("speed", "1.5")
+        self.run_command("autoenter", "off")
+        self.run_command("default", "on")
+        self.assertIn("read in full", self.run_command("length"))
+        self.assertIn("Voice is bf_emma", self.run_command("voice"))
+        self.assertIn("Speed is 1.5", self.run_command("speed"))
+        self.assertIn("Auto-Enter after Hex dictation is off", self.run_command("autoenter"))
+        self.assertIn("on by default", self.run_command("default"))
+        self.run_command("length", "1500")
+        self.assertIn("up to 1500 characters (about 65 seconds at speed 1.5)", self.run_command("length"))
+
+    def test_length_in_seconds_is_stored_as_characters(self):
+        out = self.run_command("length", "60s")
+        self.assertEqual(self.tb.load_config()["max_chars"], 990)  # 60 s x 15 chars/s x speed 1.1
+        self.assertIn("990 characters (about 60 seconds", out)
+        self.run_command("length", "2m")
+        self.assertEqual(self.tb.load_config()["max_chars"], 1980)
+        self.assertIn("Length must be", self.run_command("length", "1s"))
+        self.assertEqual(self.tb.load_config()["max_chars"], 1980)
+
+    def test_status_shows_length_in_characters_and_seconds(self):
+        self.assertIn("length=700 characters (about 40 s)", self.run_command("status"))
+        self.run_command("length", "full")
+        self.assertIn("length=full", self.run_command("status"))
+
     def test_on_off(self):
         with mock.patch.object(self.tb, "find_uv", return_value="/usr/bin/uv"):
             self.assertIn("on for this session", self.run_command("on"))
@@ -260,6 +322,22 @@ class HookTest(TalkbackTest):
         self.tb.set_session("test-session", "on")
         self.run_hook("stop", {"session_id": "test-session", "transcript_path": path})
         self.assertEqual(self.said, [("From file.", "test-session")])
+
+    def test_first_length_cut_in_a_session_shows_a_message_once(self):
+        self.tb.set_session("test-session", "on")
+        reply = "Sentence number one is here. " * 60
+        for expect in (True, False):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.run_hook("stop", {"session_id": "test-session", "last_assistant_message": reply})
+            if expect:
+                msg = json.loads(out.getvalue())["systemMessage"]
+                self.assertIn("700 characters", msg)
+                self.assertIn("/talkback full", msg)
+                self.assertIn("/talkback length", msg)
+            else:
+                self.assertEqual(out.getvalue(), "")
+        self.assertEqual(len(self.said), 2)
 
     def test_prompt_hook_stops_speech(self):
         self.tb.set_session("test-session", "on")

@@ -31,6 +31,7 @@ talkback only reads replies aloud. To speak to Claude:
 | `/talkback on` / `off` | Spoken replies for this session |
 | `/talkback status` | Settings, and whether the voice is ready |
 | `/talkback full` | Read the last reply again, in full |
+| `/talkback length 1500` | How much of a reply is read (characters, `60s`, or `full`; default 700) |
 | `/talkback voice bf_emma` | Change the [voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md) |
 | `/talkback default on` | Turn it on in every new session |
 

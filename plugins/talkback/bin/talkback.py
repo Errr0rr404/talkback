@@ -48,7 +48,9 @@ UV_DOCS = "https://docs.astral.sh/uv/getting-started/installation/"
 HEX_OFFERED = os.path.join(STATE, "hex-offered")  # the first-run mention of /talkback setup was shown
 HEX_REPO = "kitlangton/Hex"
 MAX_CHARS = 700
-TRIM_NOTE = "The rest was trimmed."  # spoken when code, a table, or the length limit drops something
+TRIM_NOTE = "The rest was trimmed."  # spoken when the length limit cuts a reply
+SKIP_NOTE = "Code skipped."  # spoken when only code or a table was left out
+CHARS_PER_SECOND = 15  # speech at speed 1.0; used to show a character limit as seconds
 SESSION_TTL = 14 * 24 * 3600  # on/off switches of sessions untouched this long are pruned
 VOICES = {  # Kokoro v1.0 English voices: first letter a = American, b = British
     "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore", "af_nicole", "af_nova", "af_river",
@@ -56,7 +58,7 @@ VOICES = {  # Kokoro v1.0 English voices: first letter a = American, b = British
     "am_puck", "am_santa", "bf_alice", "bf_emma", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable",
     "bm_george", "bm_lewis",
 }
-USAGE = ("Usage: /talkback [on|off|status|full|length <n|full>|voice <name>|speed <0.5-2>|"
+USAGE = ("Usage: /talkback [on|off|status|full|length <characters|full|60s|2m>|voice <name>|speed <0.5-2>|"
          "autoenter on|off|default on|off|say <text>|setup [yes|skip]]")
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform == "win32"
@@ -556,8 +558,13 @@ def speakable(md, limit=MAX_CHARS):
     """Markdown reply -> plain sentences worth hearing; limit=0 keeps all of it.
 
     Fenced code (backticks or tildes), table rows, long inline code, and anything past limit are
-    dropped. When that removes something, one sentence says so, so a listener can tell.
+    left out. Code only: "Code skipped." is added; a length cut: "The rest was trimmed.".
     """
+    return speakable_parts(md, limit)[0]
+
+
+def speakable_parts(md, limit=MAX_CHARS):
+    """(spoken text, cut_for_length). See speakable()."""
     dropped = False
 
     def drop(text, pattern, repl=" ", flags=0):
@@ -582,21 +589,21 @@ def speakable(md, limit=MAX_CHARS):
     t = re.sub(r"(?<!\w)([*_]{1,3})([^*_\n]+?)\1(?!\w)", r"\2", t)    # bold/italic, not snake_case
     t = re.sub(r"\s*(?:->|→)\s*", " to ", t)
     paras = [re.sub(r"\s+", " ", p).strip() for p in re.split(r"\n\s*\n", t)]
-    out = ""
-    cut = False
-    for p in filter(None, paras):
-        if limit and out and len(out) + len(p) > limit:
-            cut = True
-            break
-        out += (" " if out else "") + (p if p[-1] in ".!?:" else p + ".")
-    if limit and len(out) > limit:
-        cut = True
-        cut_at = out[:limit]
-        end = max(cut_at.rfind(". "), cut_at.rfind("? "), cut_at.rfind("! "))
-        out = cut_at[: end + 1] if end > 0 else cut_at
-    if dropped or cut:
+    out = " ".join(p if p[-1] in ".!?:" else p + "." for p in paras if p)
+    cut = bool(limit) and len(out) > limit
+    if cut:
+        # Last sentence end at or before the limit, else the last space.
+        ends = [m.end() for m in re.finditer(r"[.!?](?=\s)", out[: limit + 1]) if m.end() <= limit]
+        if ends:
+            out = out[: ends[-1]]
+        else:
+            space = out.rfind(" ", 0, limit + 1)
+            out = out[:space] if space > 0 else out[:limit]
+    if cut:
         out = (out + " " + TRIM_NOTE).strip()
-    return out
+    elif dropped:
+        out = (out + " " + SKIP_NOTE).strip()
+    return out, cut
 
 
 # ---------- Hex (macOS push-to-talk dictation), offered with consent ----------
@@ -717,14 +724,24 @@ def hook(event):
         if not is_on(session):
             return
         text = data.get("last_assistant_message") or last_reply(data.get("transcript_path", ""))
-        text = speakable(text if isinstance(text, str) else "", load_config().get("max_chars", MAX_CHARS))
+        limit = load_config().get("max_chars", MAX_CHARS)
+        text, cut = speakable_parts(text if isinstance(text, str) else "", limit)
         if text:
             say_detached(text, session)
+            notes = []
             info = starting()
             if info and info.get("first"):
                 # Shown under the reply, so a silent first reply isn't a mystery.
-                print(json.dumps({"systemMessage": "talkback is still installing Kokoro (first run). This reply "
-                                  "will be spoken when it's ready; /talkback status shows progress."}))
+                notes.append("talkback is still installing Kokoro (first run). This reply "
+                             "will be spoken when it's ready; /talkback status shows progress.")
+            marker = session_file(session, ".cutnote")
+            if cut and valid_session(session) and not os.path.exists(marker):
+                os.makedirs(SESSIONS, exist_ok=True)
+                open(marker, "w").close()  # once per session
+                notes.append(f"talkback read up to {limit} characters of this reply. /talkback full reads it in "
+                             "full; /talkback length 1500 or /talkback length full changes the limit.")
+            if notes:
+                print(json.dumps({"systemMessage": " ".join(notes)}))
     elif event == "prompt":
         # An interrupted turn never reaches Stop, so a .skipnext it left behind would silence the
         # next reply. This hook runs before a slash command writes a fresh marker for this turn.
@@ -749,6 +766,54 @@ def hook(event):
 
 
 # ---------- /talkback ----------
+
+def seconds_for(chars, speed):
+    """About how long `chars` characters take to read at `speed`, rounded to 5 s."""
+    return max(5, int(round(chars / (CHARS_PER_SECOND * speed) / 5.0)) * 5)
+
+
+def parse_length(word, speed):
+    """Characters for 'full' (0), '1500', '60s' or '2m'; None when it isn't one of those (or under 50)."""
+    if word in ("full", "all", "0"):
+        return 0
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([sm]?)", word)
+    if not m:
+        return None
+    n = float(m.group(1)) * {"": 1, "s": CHARS_PER_SECOND * speed, "m": 60 * CHARS_PER_SECOND * speed}[m.group(2)]
+    return int(round(n)) if n >= 50 else None
+
+
+def describe_length(cfg):
+    speed = cfg.get("speed", 1.1)
+    chars = cfg.get("max_chars", MAX_CHARS)
+    if not chars:
+        return "Replies are read in full. Limit them: /talkback length 700."
+    return (f"Replies are read up to {chars} characters (about {seconds_for(chars, speed)} seconds at speed "
+            f"{speed}). Change it: /talkback length 1500, /talkback length 60s, or /talkback length full. "
+            "Hear the last reply in full: /talkback full.")
+
+
+def length_status(cfg):
+    chars = cfg.get("max_chars", MAX_CHARS)
+    return f"{chars} characters (about {seconds_for(chars, cfg.get('speed', 1.1))} s)" if chars else "full"
+
+
+def describe_setting(cmd, cfg):
+    if cmd == "length":
+        return describe_length(cfg)
+    if cmd == "voice":
+        return (f"Voice is {cfg.get('voice', 'af_heart')}. Change it: /talkback voice bf_emma "
+                "(voices: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md).")
+    if cmd == "speed":
+        return f"Speed is {cfg.get('speed', 1.1)}. Change it: /talkback speed 1.3 (0.5 to 2)."
+    if cmd == "autoenter":
+        on = cfg.get("autoenter", True)
+        return (f"Auto-Enter after Hex dictation is {'on' if on else 'off'}. "
+                f"Change it: /talkback autoenter {'off' if on else 'on'}.")
+    on = cfg.get("default_on", False)
+    return (f"Talkback is {'on' if on else 'off'} by default in new sessions. "
+            f"Change it: /talkback default {'off' if on else 'on'}.")
+
 
 def command(args):
     session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -785,17 +850,18 @@ def command(args):
         open(session_file(session, ".skipnext"), "w").close()
         say_detached(text, session)
         print(f"Reading the last reply in full ({len(text)} characters).")
+    elif cmd in ("length", "voice", "speed", "autoenter", "default") and len(args) == 1:
+        print(describe_setting(cmd, cfg))
     elif cmd == "length" and len(args) > 1:
-        if args[1] in ("full", "all", "0"):
-            cfg["max_chars"] = 0
-        elif args[1].isdigit() and int(args[1]) >= 50:
-            cfg["max_chars"] = int(args[1])
-        else:
-            print("Length must be 'full' or a number of characters (50 or more).")
+        chars = parse_length(args[1], cfg.get("speed", 1.1))
+        if chars is None:
+            print("Length must be 'full', a number of characters (50 or more), or a time like 60s or 2m.")
             return
+        cfg["max_chars"] = chars
         save_config(cfg)
-        print("Replies will be read in full." if not cfg["max_chars"]
-              else f"Replies will be read up to {cfg['max_chars']} characters.")
+        print("Replies will be read in full." if not chars
+              else f"Replies will be read up to {chars} characters "
+                   f"(about {seconds_for(chars, cfg.get('speed', 1.1))} seconds at speed {cfg.get('speed', 1.1)}).")
     elif cmd == "voice" and len(args) > 1:
         if args[1] not in VOICES:
             print("Unknown voice. Pick one of: " + ", ".join(sorted(VOICES)) + ".")
@@ -837,7 +903,7 @@ def command(args):
     else:
         print(f"Talkback is {'on' if is_on(session) else 'off'} for this session. "
               f"voice={cfg.get('voice', 'af_heart')}, speed={cfg.get('speed', 1.1)}, "
-              f"length={cfg.get('max_chars', MAX_CHARS) or 'full'}, "
+              f"length={length_status(cfg)}, "
               f"autoenter={'on' if cfg.get('autoenter', True) else 'off'}, "
               f"default={'on' if cfg.get('default_on') else 'off'}, "
               f"engine={engine_status()}"
