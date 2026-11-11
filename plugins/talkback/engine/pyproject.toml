@@ -20,6 +20,8 @@ dependencies = [
 
 [tool.uv]
 package = false
+# onnxruntime 1.31 has no macOS x86_64 wheel; 1.23 is the last line that does.
+constraint-dependencies = ["onnxruntime<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'"]
 
 [tool.uv.sources]
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }

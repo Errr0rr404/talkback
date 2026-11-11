@@ -932,9 +932,10 @@ class LauncherTest(unittest.TestCase):
                     return ""
 
             def installers():
+                # Only this test's own processes (its temp dir is in their arguments), not other runs' or tools'.
                 r = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True, check=False)
                 return "\n".join(line for line in r.stdout.splitlines()
-                                 if "uv.lock" in line or "_uv_install" in line)
+                                 if home in line and ("uv.lock" in line or "_uv_install" in line))
 
             def launch(extra=None):
                 child_env = dict(env)
@@ -1078,6 +1079,13 @@ class LauncherTest(unittest.TestCase):
 
 
 class RepoFilesTest(unittest.TestCase):
+    def test_lock_has_an_intel_mac_onnxruntime_wheel(self):
+        with open(os.path.join(ROOT, "plugins", "talkback", "engine", "uv.lock"), encoding="utf-8") as f:
+            lock = f.read()
+        blocks = [b for b in lock.split("[[package]]") if b.lstrip().startswith('name = "onnxruntime"')]
+        self.assertTrue(any(re.search(r"onnxruntime-[\d.]+-cp\d+-cp\d+-macosx_\d+_\d+_(x86_64|universal2)\.whl", b)
+                            for b in blocks), "no onnxruntime wheel for Intel Macs in uv.lock")
+
     def test_gitattributes_keeps_lf_in_shell_files(self):
         if not shutil.which("git"):
             self.skipTest("git is not installed")
