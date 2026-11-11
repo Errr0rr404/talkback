@@ -382,7 +382,7 @@ def stop_spawned(proc):
         return
     if IS_WIN:
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         if proc.poll() is None:
             proc.kill()
         return

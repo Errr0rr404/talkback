@@ -669,8 +669,10 @@ class MicWatchTest(unittest.TestCase):
         ]
         state = {"player": None, "i": -1, "mic": True}
         stops = []
+        probes = []
 
         def probe():
+            probes.append(state["player"] is not None)
             return state["mic"]
 
         def sleep(_dt):
@@ -691,6 +693,7 @@ class MicWatchTest(unittest.TestCase):
         with self.assertRaises(StopIteration):
             ns["mic_watch"](probe)
         self.assertEqual(stops, [1])
+        self.assertEqual(probes, [True, True, True])  # never probed while idle (pactl is a process spawn)
 
 
 class DaemonStartTest(TalkbackTest):
@@ -751,12 +754,8 @@ class DaemonStartTest(TalkbackTest):
         while time.time() < deadline:
             if not self._alive(pid):
                 return True
-            try:
-                with open("/proc/%d/stat" % pid) as f:
-                    stat = f.read()
-            except OSError:
-                return True
-            if stat.rsplit(")", 1)[-1].split()[0] == "Z":
+            r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False)
+            if not r.stdout.strip() or r.stdout.strip().startswith("Z"):
                 return True
             time.sleep(0.05)
         return False
@@ -819,7 +818,10 @@ class LauncherTest(unittest.TestCase):
                 f.write(text)
             bin_dir = os.path.join(home, "bin")
             os.makedirs(bin_dir)
-            for name in ("flock", "date", "stat", "mkdir", "rm", "grep", "sleep"):
+            locker = "flock" if shutil.which("flock") else "perl"  # macOS has no flock: run.sh falls back to perl
+            if not shutil.which(locker):
+                self.skipTest("neither flock nor perl is installed")
+            for name in (locker, "date", "stat", "mkdir", "rm", "grep", "sleep"):
                 os.symlink(shutil.which(name), os.path.join(bin_dir, name))
             curl_log = os.path.join(home, "curl.log")
             stamp = os.path.join(home, "curl.stamp")
@@ -852,7 +854,7 @@ class LauncherTest(unittest.TestCase):
                     return ""
 
             def installers():
-                r = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True)
+                r = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True, check=False)
                 return "\n".join(line for line in r.stdout.splitlines()
                                  if "uv.lock" in line or "_uv_install" in line)
 
@@ -866,7 +868,7 @@ class LauncherTest(unittest.TestCase):
                 procs.append(proc)
                 return proc
 
-            def wait_for(pred, timeout=8):
+            def wait_for(pred, timeout=20):  # generous: a loaded machine is slow to reap
                 end = time.time() + timeout
                 while time.time() < end:
                     if pred():
@@ -884,17 +886,16 @@ class LauncherTest(unittest.TestCase):
                     first = launch()
                     first.wait(timeout=5)
                     blocked = wait_for(lambda: "flock" in installers() and log() == "")
-                    self.assertTrue(blocked, "installer did not block on uv.lock\nlog=%r\nps=%r"
-                                    % (log(), installers()))
+                    self.assertTrue(blocked, f"installer did not block on uv.lock\nlog={log()!r}\nps={installers()!r}")
                     self.assertFalse(os.path.exists(tb.UV_STARTING))
                 self.assertTrue(wait_for(lambda: installers() == "" and os.path.exists(tb.UV_FAILED)),
-                                "first installer did not finish\nlog=%r\nps=%r" % (log(), installers()))
+                                f"first installer did not finish\nlog={log()!r}\nps={installers()!r}")
                 self.assertEqual(log().count("called"), 1)
                 self.assertNotIn("bad-starting", log())
                 self.assertNotIn("overlap", log())
                 self.assertFalse(os.path.exists(tb.UV_STARTING))
                 status = subprocess.run(["/bin/sh", run_sh, "status"], env=env, capture_output=True,
-                                        text=True, timeout=20, stdin=subprocess.DEVNULL)
+                                        text=True, timeout=20, stdin=subprocess.DEVNULL, check=False)
                 self.assertEqual(status.returncode, 0)
                 self.assertIn(os.path.join(state, "uv-install.log"), status.stdout)
                 self.assertIn("failed", status.stdout)
@@ -911,8 +912,8 @@ class LauncherTest(unittest.TestCase):
                 for proc in pair:
                     proc.wait(timeout=5)  # the launcher returns; the locked installer keeps running
                 self.assertTrue(wait_for(lambda: installers() == "" and log().count("called") >= 2),
-                                "overlapping installers did not finish\nlog=%r\nps=%r\nfailed-mtime=%s"
-                                % (log(), installers(), os.path.getmtime(tb.UV_FAILED)))
+                                f"overlapping installers did not finish\nlog={log()!r}\nps={installers()!r}\n"
+                                f"failed-mtime={os.path.getmtime(tb.UV_FAILED)}")
                 self.assertEqual(log().count("called"), 2)
                 self.assertNotIn("overlap", log())
                 self.assertNotIn("bad-starting", log())

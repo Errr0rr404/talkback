@@ -308,12 +308,19 @@ def handle(conn):
 
 
 def mic_watch(probe):
-    """Stop only when the mic goes from off to on. An already-open mic must not cut off the next reply."""
-    was_on = probe()
+    """Stop only when the mic goes from off to on during speech. An already-open mic must not cut off a reply.
+
+    The probe runs only while something plays (on Linux it spawns pactl), and its first reading for each
+    reply is the baseline, not a press.
+    """
+    was_on = None  # None: nothing playing, so no baseline yet
     while True:
         time.sleep(0.15)
-        on = probe()  # sampled while idle too, so a mic that was already open is not a new press
-        if current["player"] is not None and on and not was_on:
+        if current["player"] is None:
+            was_on = None
+            continue
+        on = probe()
+        if was_on is False and on:
             stop()
             log("microphone turned on: stopped speech")
         was_on = on
