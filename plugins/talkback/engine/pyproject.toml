@@ -1,6 +1,6 @@
 [project]
 name = "talkback-engine"
-version = "0.3.0"
+version = "0.4.9"
 description = "Kokoro-82M text-to-speech daemon for the talkback Claude Code plugin"
 requires-python = ">=3.11,<3.14"
 dependencies = [

@@ -42,7 +42,7 @@ More (speed, length, auto-Enter, say, setup) in [How it works](docs/how-it-works
 - **No sound:** run `/talkback status`. `installing Kokoro` means wait; `stopped` means look at `~/.talkback/voiced.log`.
 - **`needs uv`:** the automatic download failed (see `~/.talkback/uv-install.log`). [Install uv](https://docs.astral.sh/uv/getting-started/installation/) and restart Claude Code.
 - **Linux, no sound:** install an audio player (`pipewire`, `pulseaudio-utils` or `alsa-utils`).
-- **macOS, Enter isn't pressed after Hex:** give your terminal Accessibility permission (System Settings, Privacy & Security).
+- **macOS, Enter isn't pressed after Hex:** it works in Terminal and iTerm2 only (not VS Code, Ghostty, Warp or others). Give your terminal Accessibility permission (System Settings, Privacy & Security).
 
 ## Uninstall
 
