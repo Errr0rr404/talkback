@@ -140,7 +140,7 @@ def send(req, timeout=2.0):
 
 
 def ping():
-    """(engine, version) of the running daemon, or None."""
+    """(engine, version, player) of the running daemon, or None."""
     try:
         parts = send({"cmd": "ping"}, timeout=1).split()
     except OSError:
@@ -148,13 +148,13 @@ def ping():
     if not parts or parts[0] != "pong":
         return None
     remove(START_FAILED)  # it answered, so a start that timed out earlier is no longer the latest word
-    return (parts[1] if len(parts) > 1 else "?", parts[2] if len(parts) > 2 else "?")
+    return tuple(parts[i] if len(parts) > i else "?" for i in (1, 2, 3))
 
 
 def engine_status():
     p = ping()
     if p:
-        return f"running ({p[0]})"
+        return f"running ({p[0]}, player={p[2]})" if p[2] != "?" else f"running ({p[0]})"
     if not find_uv():
         if uv_installing():
             return "installing uv, first run (Kokoro follows; usually a few minutes in all)"
@@ -456,6 +456,8 @@ def warm_detached():
 # ---------- the macOS helper (mic-stop + auto-Enter) ----------
 
 def pid_alive(pid):
+    if os.name == "nt":
+        return False  # os.kill(pid, 0) terminates the process on Windows; only the macOS helper needs this
     try:
         os.kill(pid, 0)
         return True

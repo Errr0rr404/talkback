@@ -389,8 +389,8 @@ class InstallStatusTest(TalkbackTest):
             self.assertEqual(self.tb.engine_status(), "starting")
 
     def test_status_when_daemon_running(self):
-        with mock.patch.object(self.tb, "ping", return_value=("127.0.0.1:51123", "0.4.0")):
-            self.assertEqual(self.tb.engine_status(), "running (127.0.0.1:51123)")
+        with mock.patch.object(self.tb, "ping", return_value=("127.0.0.1:51123", "0.4.0", "aplay")):
+            self.assertEqual(self.tb.engine_status(), "running (127.0.0.1:51123, player=aplay)")
 
     def test_status_after_failed_start(self):
         open(self.tb.START_FAILED, "w").close()
@@ -774,6 +774,190 @@ class MicWatchTest(unittest.TestCase):
         self.assertEqual(probes, [True, True, True])  # never probed while idle (pactl is a process spawn)
 
 
+def load_voiced(names, **extra):
+    """voiced.py imports the TTS stack and starts an engine at import, so exec only the named top-level parts."""
+    path = os.path.join(ROOT, "plugins", "talkback", "engine", "voiced.py")
+    with open(path) as f:
+        tree = ast.parse(f.read())
+    keep = []
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names:
+            keep.append(n)
+        elif isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in n.targets):
+            keep.append(n)
+    ns = {"os": os, "sys": sys, "time": time, "shutil": shutil, "subprocess": subprocess, "tempfile": tempfile,
+          "threading": __import__("threading"), "log": lambda *a, **k: None}
+    ns.update(extra)
+    exec(compile(ast.Module(keep, type_ignores=[]), path, "exec"), ns)
+    return ns
+
+
+PLAYER_PARTS = ("FAST_FAIL", "PLAYER_GRACE", "ProcPlayer", "NullPlayer", "WinPlayer", "LINUX_PLAYERS", "player_factory")
+
+
+class DaemonPlayerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bin = os.path.join(self.tmp.name, "bin")
+        os.makedirs(self.bin)
+        self.marker = os.path.join(self.tmp.name, "marker")
+        self.logs = []
+        os.symlink(shutil.which("sleep"), os.path.join(self.bin, "sleep"))
+        env = mock.patch.dict(os.environ, {"PATH": self.bin, "TALKBACK_PLAYER": ""})  # only the fake players
+        env.start()
+        self.addCleanup(env.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake(self, name, body):
+        path = os.path.join(self.bin, name)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+
+    def play(self, **env):
+        ns = load_voiced(PLAYER_PARTS, sys=type("S", (), {"platform": "linux"}), log=self.logs.append)
+        with mock.patch.dict(os.environ, env):
+            make_player, name = ns["player_factory"]()
+        return ns, make_player, name
+
+    def test_failing_player_falls_back_to_the_next_one(self):
+        self.fake("pw-play", "echo 'no pipewire daemon' >&2; exit 1")
+        self.fake("aplay", f'echo "$@" > "{self.marker}"')
+        ns, make_player, name = self.play()
+        self.assertEqual(name(), "pw-play")
+        for _ in range(2):  # the second segment must not retry pw-play
+            player = make_player("seg.wav", 0.1)
+            player.wait()
+        with open(self.marker) as f:
+            self.assertEqual(f.read().strip(), "-q seg.wav")
+        self.assertEqual(name(), "aplay")
+        self.assertEqual(len(self.logs), 1)
+        self.assertIn("pw-play", self.logs[0])
+        self.assertIn("no pipewire daemon", self.logs[0])
+
+    def test_a_single_failing_player_is_logged_once_and_kept(self):
+        self.fake("aplay", "echo bad >&2; exit 2")
+        ns, make_player, name = self.play()
+        for _ in range(3):
+            make_player("seg.wav", 0.1).wait()
+        self.assertEqual(name(), "aplay")
+        self.assertEqual(len(self.logs), 1)
+
+    def test_a_hung_player_is_killed_after_the_segment_length_plus_grace(self):
+        self.fake("aplay", "sleep 30")
+        ns, make_player, name = self.play()
+        ns["PLAYER_GRACE"] = 0.3
+        started = time.time()
+        make_player("seg.wav", 0.2).wait()
+        self.assertLess(time.time() - started, 5)
+        self.assertTrue(any("killed" in line for line in self.logs))
+
+    def test_kill_does_not_count_as_a_failure(self):
+        self.fake("aplay", "sleep 30")
+        ns, make_player, name = self.play()
+        player = make_player("seg.wav", 20)
+        player.kill()
+        player.wait()
+        self.assertEqual(self.logs, [])
+
+    def test_choice_and_none(self):
+        self.fake("pw-play", "exit 0")
+        self.fake("aplay", "exit 0")
+        self.assertEqual(self.play(TALKBACK_PLAYER="aplay")[2](), "aplay")
+        self.assertEqual(self.play(TALKBACK_PLAYER="none")[2](), "none")
+
+    def test_windows_player_flags_tail_and_purge(self):
+        calls = []
+        fake = mock.Mock(SND_FILENAME=0x20000, SND_ASYNC=1, SND_NODEFAULT=2, SND_PURGE=0x40)
+        fake.PlaySound = lambda *a: calls.append(a)
+        ns = load_voiced(PLAYER_PARTS)
+        with mock.patch.dict(sys.modules, {"winsound": fake}), mock.patch.object(time, "time", return_value=100.0):
+            player = ns["WinPlayer"]("a.wav", 2.0)
+        self.assertEqual(calls[0], ("a.wav", 0x20000 | 1 | 2))
+        self.assertAlmostEqual(player.end, 102.25)
+        player.kill()
+        self.assertEqual(calls[1], (None, 0x40))
+        self.assertTrue(player.killed)
+
+
+class DaemonSpeakTest(unittest.TestCase):
+    """speak, speak_locked and replace_retry against a fake engine and fake player."""
+
+    def ns(self, **extra):
+        import threading
+        state = {"gen": 0, "session": None, "player": None}
+        made = []
+
+        class Player:
+            def __init__(self, path, seconds):
+                self.killed = False
+                made.append(self)
+
+            def wait(self):
+                pass
+
+            def kill(self):
+                self.killed = True
+
+        sf = type("SF", (), {"write": staticmethod(lambda path, audio, rate: open(path, "wb").close())})
+        ns = load_voiced(("speak", "speak_locked", "stop", "replace_retry", "SAMPLE_RATE"),
+                         current=state, lock=threading.Lock(), speak_lock=threading.Lock(), sf=sf,
+                         make_player=Player, config=lambda: {}, **extra)
+        return ns, state, made
+
+    def test_stop_during_synthesis_starts_no_further_segment(self):
+        ns, state, made = self.ns()
+
+        class Engine:
+            def generate(self, text, voice, speed):
+                yield [0.0] * 2400
+                ns["stop"]()  # a stop arrives while the next segment is being synthesized
+                yield [0.0] * 2400
+                yield [0.0] * 2400
+
+        ns["engine"] = Engine()
+        ns["speak"]("hello", "s1")
+        self.assertEqual(len(made), 1)
+
+    def test_a_new_say_replaces_the_one_before_it(self):
+        ns, state, made = self.ns()
+        spoken = []
+
+        class Engine:
+            def generate(self, text, voice, speed):
+                spoken.append(text)
+                yield [0.0] * 2400
+
+        ns["engine"] = Engine()
+        import threading
+        # An old reply is still winding down (speak_lock held) while two says arrive: only the later one speaks.
+        ns["speak_lock"].acquire()
+        threads = []
+        for n, text in enumerate(("first", "second"), 1):
+            t = threading.Thread(target=ns["speak"], args=(text, "s1"))
+            t.start()
+            threads.append(t)
+            deadline = time.time() + 5
+            while state["gen"] < n and time.time() < deadline:
+                time.sleep(0.01)
+        ns["speak_lock"].release()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(spoken, ["second"])
+
+    def test_replace_retries_a_locked_file(self):
+        ns, _, _ = self.ns(time=type("T", (), {"sleep": staticmethod(lambda d: None)}))
+        with mock.patch.object(os, "replace", side_effect=[PermissionError, PermissionError, None]) as rep:
+            ns["replace_retry"]("a", "b")
+        self.assertEqual(rep.call_count, 3)
+        with mock.patch.object(os, "replace", side_effect=PermissionError) as rep:
+            with self.assertRaises(PermissionError):
+                ns["replace_retry"]("a", "b")
+        self.assertEqual(rep.call_count, 5)
+
+
 class DaemonStartTest(TalkbackTest):
     def test_ping_clears_start_failed(self):
         open(self.tb.START_FAILED, "w").close()
@@ -784,6 +968,17 @@ class DaemonStartTest(TalkbackTest):
             open(self.tb.START_FAILED, "w").close()
             self.assertIn("running", self.tb.engine_status())
         self.assertFalse(os.path.exists(self.tb.START_FAILED))
+
+    def test_status_shows_the_player(self):
+        with mock.patch.object(self.tb, "send", return_value="pong onnx " + self.tb.plugin_version() + " aplay"):
+            self.assertIn("player=aplay", self.tb.engine_status())
+
+    def test_pid_alive_never_signals_on_windows(self):
+        fake_os = mock.Mock(name="os", kill=mock.Mock())
+        fake_os.name = "nt"
+        with mock.patch.object(self.tb, "os", fake_os):
+            self.assertFalse(self.tb.pid_alive(1234))
+        fake_os.kill.assert_not_called()
 
     def test_start_timeout_kills_the_child(self):
         # A session leader plus a grandchild, the shape of `uv run` spawning python.
