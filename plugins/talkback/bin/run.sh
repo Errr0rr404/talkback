@@ -11,6 +11,10 @@ if [ "$1" = "--from-stdin" ]; then
   shift
   args_file=$(mktemp "${TMPDIR:-/tmp}/talkback-args.XXXXXX") || exit 1
   cat > "$args_file" || { rm -f "$args_file"; exit 1; }
+  # Git Bash: uv.exe gets this path only through MSYS conversion, which MSYS_NO_PATHCONV=1 turns off.
+  if command -v cygpath >/dev/null 2>&1; then
+    args_file=$(cygpath -m "$args_file" 2>/dev/null || printf '%s' "$args_file")
+  fi
   set -- --args-file "$args_file" "$@"
 fi
 
@@ -60,7 +64,13 @@ if [ -n "$uv" ]; then
 fi
 
 # No uv yet: talkback.py is standard-library only, so any Python 3.8+ can run it (it installs uv itself).
+# A Mac without the Command Line Tools has a python3 stub that opens Apple's install dialog: skip Python there.
+no_python=
+if [ "$(uname -s 2>/dev/null)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; then
+  no_python=1
+fi
 for p in python3 python; do
+  [ -n "$no_python" ] && break
   if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
     exec "$p" "$py" "$@"
   fi

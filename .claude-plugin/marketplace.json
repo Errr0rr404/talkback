@@ -8,7 +8,7 @@
     {
       "name": "talkback",
       "source": "./plugins/talkback",
-      "version": "0.4.8",
+      "version": "0.4.9",
       "description": "Hear Claude Code's replies in a natural voice that runs on your machine. Optional: talk back with /voice, or with Hex on macOS."
     }
   ],

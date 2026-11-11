@@ -27,6 +27,10 @@ class TalkbackTest(unittest.TestCase):
         self.home = tempfile.TemporaryDirectory()
         os.environ["TALKBACK_HOME"] = self.home.name
         os.environ["CLAUDE_CODE_SESSION_ID"] = "test-session"
+        entry = mock.patch.dict(os.environ)  # the suite may itself run inside `claude -p` (sdk-cli)
+        entry.start()
+        self.addCleanup(entry.stop)
+        os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
         import talkback
         self.tb = importlib.reload(talkback)  # re-read TALKBACK_HOME
         self.said = []
@@ -217,6 +221,45 @@ class CommandTest(TalkbackTest):
             self.assertEqual(self.said, [("This is a full response from assistant.", "test-session")])
             self.assertTrue(os.path.exists(self.tb.session_file("test-session", ".skipnext")))
 
+    def test_full_reads_the_reply_the_stop_hook_saved(self):
+        self.tb.set_session("test-session", "on")
+        self.run_hook("stop", {"session_id": "test-session", "last_assistant_message": "Saved reply, in full."})
+        self.said.clear()
+        with mock.patch.object(self.tb, "find_transcript", return_value=""):
+            out = self.run_command("full")
+        self.assertIn("Reading the last reply in full", out)
+        self.assertEqual(self.said, [("Saved reply, in full.", "test-session")])
+        if os.name == "posix":
+            mode = os.stat(self.tb.session_file("test-session", ".last")).st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+
+    def test_stop_hook_does_not_save_while_off_or_for_the_full_reply(self):
+        self.run_hook("stop", {"session_id": "test-session", "last_assistant_message": "Off."})
+        self.assertFalse(os.path.exists(self.tb.session_file("test-session", ".last")))
+        self.tb.set_session("test-session", "on")
+        open(self.tb.session_file("test-session", ".skipnext"), "w").close()
+        self.run_hook("stop", {"session_id": "test-session", "last_assistant_message": "The reply to full."})
+        self.assertFalse(os.path.exists(self.tb.session_file("test-session", ".last")))
+
+    def test_pruning_removes_the_saved_reply_with_the_session(self):
+        self.tb.save_last_reply("old", "text")
+        path = self.tb.session_file("old", ".last")
+        old = time.time() - self.tb.SESSION_TTL - 10
+        os.utime(path, (old, old))
+        self.tb.prune_sessions()
+        self.assertFalse(os.path.exists(path))
+
+    def test_full_finds_the_transcript_under_claude_config_dir(self):
+        cfg = os.path.join(self.home.name, "cfg")
+        proj = os.path.join(cfg, "projects", "-some-project")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "test-session.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "From the config dir."}]}}) + "\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": cfg}):
+            out = self.run_command("full")
+        self.assertIn("Reading the last reply in full", out)
+        self.assertEqual(self.said, [("From the config dir.", "test-session")])
+
     def test_status_command(self):
         with mock.patch.object(self.tb, "find_uv", return_value="/usr/bin/uv"):
             out = self.run_command("status")
@@ -305,6 +348,19 @@ class HookTest(TalkbackTest):
         self.run_hook("stop", {"session_id": "other", "last_assistant_message": "Hi."})
         self.assertEqual(len(self.said), 1)
 
+    def test_default_on_skips_headless_sessions_but_not_an_explicit_on(self):
+        self.tb.save_config({"default_on": True})
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}):
+            self.run_hook("stop", {"session_id": "other", "last_assistant_message": "Hi."})
+            self.assertEqual(self.said, [])
+            self.tb.set_session("other", "on")
+            self.run_hook("stop", {"session_id": "other", "last_assistant_message": "Hi."})
+        self.assertEqual(len(self.said), 1)
+        self.said.clear()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "cli"}):
+            self.run_hook("stop", {"session_id": "third", "last_assistant_message": "Hi."})
+        self.assertEqual(len(self.said), 1)
+
     def test_skipnext_survives_off_and_is_used_once(self):
         os.makedirs(self.tb.SESSIONS)
         open(self.tb.session_file("test-session", ".skipnext"), "w").close()
@@ -341,6 +397,12 @@ class HookTest(TalkbackTest):
 
     def test_prompt_hook_stops_speech(self):
         self.tb.set_session("test-session", "on")
+        sent = []
+        with mock.patch.object(self.tb, "send", lambda req, timeout=0.5: sent.append(req)):
+            self.run_hook("prompt", {"session_id": "test-session"})
+        self.assertEqual(sent, [{"cmd": "stop", "session": "test-session"}])
+
+    def test_prompt_hook_stops_speech_even_when_the_session_is_off(self):
         sent = []
         with mock.patch.object(self.tb, "send", lambda req, timeout=0.5: sent.append(req)):
             self.run_hook("prompt", {"session_id": "test-session"})
@@ -532,7 +594,8 @@ class UvBootstrapTest(TalkbackTest):
         warmed = []
         self.tb.warm_detached = lambda: warmed.append(1)
         open(self.tb.START_FAILED, "w").close()
-        self.run_hook("session-start", {"session_id": "s1"})
+        with redirect_stdout(io.StringIO()):
+            self.run_hook("session-start", {"session_id": "s1"})
         self.assertEqual(warmed, [])
 
     def test_warm_chains_uv_then_kokoro(self):
@@ -793,6 +856,47 @@ def load_voiced(names, **extra):
 
 
 PLAYER_PARTS = ("FAST_FAIL", "PLAYER_GRACE", "ProcPlayer", "NullPlayer", "WinPlayer", "LINUX_PLAYERS", "player_factory")
+
+
+class ModelDownloadTest(unittest.TestCase):
+    def fetch(self, payload, name="voices-v1.0.bin", digest=None):
+        import hashlib
+        import types
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, name)
+
+            def fake_urlretrieve(url, path):
+                self.assertTrue(url.endswith(name))
+                with open(path, "wb") as f:
+                    f.write(payload)
+
+            fake_urllib = types.SimpleNamespace(request=types.SimpleNamespace(urlretrieve=fake_urlretrieve))
+            ns = load_voiced(("ONNX_URL", "ONNX_SHA256", "fetch_model"), hashlib=hashlib, urllib=fake_urllib)
+            if digest:
+                ns["ONNX_SHA256"][name] = digest
+            try:
+                ns["fetch_model"](name, dest)
+                return os.path.exists(dest), os.listdir(tmp)
+            except RuntimeError as e:
+                self.assertIn("SHA-256", str(e))
+                return False, os.listdir(tmp)
+
+    def test_pinned_hashes_cover_both_model_files(self):
+        ns = load_voiced(("ONNX_SHA256",))
+        self.assertEqual(sorted(ns["ONNX_SHA256"]), ["kokoro-v1.0.onnx", "voices-v1.0.bin"])
+        for value in ns["ONNX_SHA256"].values():
+            self.assertRegex(value, r"^[0-9a-f]{64}$")
+
+    def test_matching_download_is_moved_into_place(self):
+        import hashlib
+        placed, files = self.fetch(b"model bytes", digest=hashlib.sha256(b"model bytes").hexdigest())
+        self.assertTrue(placed)
+        self.assertEqual(files, ["voices-v1.0.bin"])
+
+    def test_a_mismatched_download_is_discarded(self):
+        placed, files = self.fetch(b"tampered")
+        self.assertFalse(placed)
+        self.assertEqual(files, [])  # no model file and no .part left behind
 
 
 class DaemonPlayerTest(unittest.TestCase):
@@ -1056,6 +1160,63 @@ class LauncherTest(unittest.TestCase):
                                stdin=subprocess.DEVNULL, check=False)
             self.assertIn("installing uv", r.stdout)
 
+    def _fake_launcher(self, home, tools):
+        """A run.sh copy without system uv paths, and a bin dir holding only the fake tools given (name -> script)."""
+        src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
+        run_sh = os.path.join(home, "run.sh")
+        with open(src, encoding="utf-8") as f:
+            text = f.read().replace("/opt/homebrew/bin/uv /usr/local/bin/uv", "")
+        with open(run_sh, "w", encoding="utf-8") as f:
+            f.write(text)
+        bin_dir = os.path.join(home, "bin")
+        os.makedirs(bin_dir)
+        for tool in ("mktemp", "cat", "rm", "date", "stat", "mkdir"):
+            os.symlink(shutil.which(tool), os.path.join(bin_dir, tool))
+        for name, body in tools.items():
+            path = os.path.join(bin_dir, name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        tmp = os.path.join(home, "tmp")
+        os.makedirs(tmp)
+        env = {"HOME": home, "PATH": bin_dir, "TALKBACK_HOME": os.path.join(home, "tb"), "TMPDIR": tmp}
+        return run_sh, env
+
+    def _mac_launcher_run(self, clt_installed):
+        import subprocess
+        with tempfile.TemporaryDirectory() as home:
+            marker = os.path.join(home, "python-ran")
+            run_sh, env = self._fake_launcher(home, {
+                "uname": "echo Darwin\n",
+                "xcode-select": "exit %d\n" % (0 if clt_installed else 2),
+                "python3": 'case "$1" in -c) exit 0;; esac\n: > "%s"\n' % marker,
+            })
+            subprocess.run(["/bin/sh", run_sh, "status"], env=env, capture_output=True, text=True, timeout=20,
+                           stdin=subprocess.DEVNULL, check=False)
+            return os.path.exists(marker)
+
+    def test_mac_without_command_line_tools_never_runs_the_python_stub(self):
+        self.assertFalse(self._mac_launcher_run(clt_installed=False))
+
+    def test_mac_with_command_line_tools_still_uses_python(self):
+        self.assertTrue(self._mac_launcher_run(clt_installed=True))
+
+    def test_stdin_arguments_are_passed_as_a_cygpath_path_on_git_bash(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as home:
+            record = os.path.join(home, "record")
+            run_sh, env = self._fake_launcher(home, {
+                "cygpath": 'echo "$2.win"\n',
+                "python3": 'case "$1" in -c) exit 0;; esac\nprintf "%%s\\n" "$@" > "%s"\n' % record,
+            })
+            r = subprocess.run(["/bin/sh", run_sh, "--from-stdin"], env=env, input="say hi\n", capture_output=True,
+                               text=True, timeout=20, check=False)
+            with open(record, encoding="utf-8") as f:
+                args = f.read().split("\n")
+            self.assertEqual(args[1], "--args-file", r.stderr)
+            self.assertTrue(args[2].endswith(".win"), args)
+            self.assertIn(os.path.join(home, "tmp"), args[2])
+
     def test_no_runtime_removes_the_argument_file(self):
         src = os.path.join(ROOT, "plugins", "talkback", "bin", "run.sh")
         with tempfile.TemporaryDirectory() as home:
@@ -1281,6 +1442,18 @@ class RepoFilesTest(unittest.TestCase):
         self.assertTrue(any(re.search(r"onnxruntime-[\d.]+-cp\d+-cp\d+-macosx_\d+_\d+_(x86_64|universal2)\.whl", b)
                             for b in blocks), "no onnxruntime wheel for Intel Macs in uv.lock")
 
+    def test_every_manifest_carries_the_same_version(self):
+        def load(*rel):
+            with open(os.path.join(ROOT, *rel), encoding="utf-8") as f:
+                return f.read()
+
+        plugin = json.loads(load("plugins", "talkback", ".claude-plugin", "plugin.json"))["version"]
+        market = json.loads(load(".claude-plugin", "marketplace.json"))["plugins"][0]["version"]
+        engine = re.search(r'^version = "([^"]+)"', load("plugins", "talkback", "engine", "pyproject.toml"), re.M)
+        locked = re.search(r'name = "talkback-engine"\nversion = "([^"]+)"',
+                           load("plugins", "talkback", "engine", "uv.lock"))
+        self.assertEqual({plugin, market, engine.group(1), locked.group(1)}, {plugin})
+
     def test_gitattributes_keeps_lf_in_shell_files(self):
         if not shutil.which("git"):
             self.skipTest("git is not installed")
@@ -1329,6 +1502,35 @@ class SessionLifecycleTest(TalkbackTest):
             self.assertTrue(self.tb.daemon_alive())
 
 
+class HelperBuildTest(TalkbackTest):
+    def build(self, xcode_rc):
+        built = []
+
+        def fake_run(cmd, *a, **k):
+            if cmd[0] == "xcode-select":
+                return mock.Mock(returncode=xcode_rc)
+            built.append(cmd)
+            return mock.Mock(returncode=1)
+
+        arm = mock.Mock(machine="arm64")
+        with mock.patch.object(self.tb.shutil, "which", return_value="/usr/bin/swiftc"), \
+             mock.patch.object(self.tb.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(self.tb.os, "uname", return_value=arm):
+            return self.tb.build_helper(), built
+
+    def test_no_command_line_tools_uses_the_prebuilt_helper_without_build_sh(self):
+        ok, built = self.build(xcode_rc=2)
+        self.assertTrue(ok)
+        self.assertEqual(built, [])
+        self.assertTrue(os.path.exists(self.tb.HELPER_BIN))
+
+    def test_command_line_tools_run_build_sh_first(self):
+        ok, built = self.build(xcode_rc=0)
+        self.assertEqual(len(built), 1)
+        self.assertTrue(built[0][0].endswith("build.sh"))
+        self.assertTrue(ok)  # build.sh failed here, so the prebuilt copy still serves
+
+
 class MainTest(TalkbackTest):
     def test_main_speak(self):
         sent = []
@@ -1352,6 +1554,44 @@ class MainTest(TalkbackTest):
             self.tb.main()
         self.assertFalse(os.path.exists(tmp))
         self.assertEqual(sent, [{"cmd": "say", "session": "test-session", "text": "text from file"}])
+
+    def test_say_worker_speaks_before_it_builds_the_mic_helper(self):
+        tmp = os.path.join(self.home.name, "say.txt")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("hello")
+        order = []
+        with mock.patch.object(self.tb, "ensure_uv", lambda: order.append("uv")), \
+             mock.patch.object(self.tb, "ensure_daemon", lambda: order.append("daemon") or True), \
+             mock.patch.object(self.tb, "send", lambda req, timeout=30: order.append("say")), \
+             mock.patch.object(self.tb, "ensure_helper", lambda: order.append("helper")), \
+             mock.patch.object(sys, "argv", ["talkback.py", "_say", "test-session", tmp]):
+            self.tb.main()
+        self.assertEqual(order, ["uv", "daemon", "say", "helper"])
+
+    def test_output_is_utf8_even_when_the_console_is_cp1252(self):
+        raw = io.BytesIO()
+        console = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+        with mock.patch.object(sys, "stdout", console), mock.patch.object(sys, "stderr", io.StringIO()):
+            self.tb.utf8_streams()
+            print("Home: C:\\Users\\\u0141ukasz \u2192 ok")  # Ł is not in cp1252 \u2192 is not either
+            console.flush()
+        self.assertEqual(raw.getvalue().decode("utf-8").strip(), "Home: C:\\Users\\\u0141ukasz \u2192 ok")
+
+    def test_utf8_streams_tolerates_streams_that_cannot_be_reconfigured(self):
+        with mock.patch.object(sys, "stdout", io.StringIO()), mock.patch.object(sys, "stderr", object()):
+            self.tb.utf8_streams()
+
+    def test_daemon_runs_in_utf8_mode(self):
+        seen = {}
+
+        def fake_spawn(cmd, log_path=None, env=None, cwd=None):
+            seen.update(env)
+            return mock.Mock(poll=lambda: 1)
+
+        with mock.patch.object(self.tb, "spawn_detached", fake_spawn), \
+                mock.patch.object(self.tb, "daemon_alive", return_value=False):
+            self.tb.start_daemon("uv", 0)
+        self.assertEqual(seen.get("PYTHONUTF8"), "1")
 
 
 if __name__ == "__main__":

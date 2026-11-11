@@ -27,7 +27,7 @@ The voice always runs on your machine. Claude Code's `/voice` sends your audio t
 | `/talkback length 1500` | Read up to 1500 characters per reply. Also `60s` or `2m` (about that long at the current speed), `full` (`all`, `0`) for whole replies; `length` alone shows the setting |
 | `/talkback voice bf_emma` | Change the [voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md) (default `af_heart`) |
 | `/talkback speed 1.3` | Speaking speed, 0.5 to 2 (default 1.1) |
-| `/talkback default on` | Turn it on in every new session |
+| `/talkback default on` | Turn it on in every new session (not in headless `claude -p` runs; `/talkback on` there still works) |
 | `/talkback autoenter off` | Stop pressing Enter after Hex |
 | `/talkback say hello` | Speak any text |
 | `/talkback setup` | macOS: offer to install Hex and open its permission panes (`setup yes` to go ahead, `setup skip` to decline) |

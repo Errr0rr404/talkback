@@ -119,6 +119,9 @@ def is_on(session):
         with open(session_file(session)) as f:
             return f.read().strip() == "on"
     except OSError:
+        # `claude -p` (headless, scripts, CI) reports sdk-cli: "on by default" is for people at the keyboard.
+        if os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-cli":
+            return False
         return bool(load_config().get("default_on", False))
 
 
@@ -405,7 +408,7 @@ def stop_spawned(proc):
 
 
 def start_daemon(uv, wait):
-    env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE, PYTHONUNBUFFERED="1",
+    env = dict(os.environ, UV_PROJECT_ENVIRONMENT=VENV, TALKBACK_HOME=STATE, PYTHONUNBUFFERED="1", PYTHONUTF8="1",
                TALKBACK_VERSION=plugin_version())
     proc = spawn_detached([uv, "run", "--project", ENGINE, "--frozen", "python", os.path.join(ENGINE, "voiced.py")],
                           log_path=os.path.join(STATE, "voiced.log"), env=env, cwd=STATE)
@@ -483,12 +486,20 @@ def helper_running():
     return helper_pid() is not None
 
 
+def xcode_tools():
+    """True when the Xcode command line tools are installed (the swiftc shim alone is not enough)."""
+    try:
+        return subprocess.run(["xcode-select", "-p"], capture_output=True, check=False).returncode == 0
+    except OSError:
+        return False
+
+
 def build_helper():
     src = os.path.join(HELPER_SRC, "main.swift")
     if os.path.exists(HELPER_BIN) and os.path.getmtime(HELPER_BIN) >= os.path.getmtime(src):
         return True
     os.makedirs(os.path.dirname(HELPER_BIN), exist_ok=True)
-    if shutil.which("swiftc"):
+    if shutil.which("swiftc") and xcode_tools():
         r = subprocess.run([os.path.join(HELPER_SRC, "build.sh"), HELPER_BIN], capture_output=True, text=True,
                            check=False)
         if r.returncode == 0:
@@ -527,8 +538,40 @@ def ensure_helper():
 # ---------- turning a reply into speech ----------
 
 def find_transcript(session):
-    hits = glob.glob(os.path.join(os.path.expanduser("~"), ".claude", "projects", "*", session + ".jsonl"))
-    return hits[0] if hits else ""
+    if not valid_session(session):
+        return ""
+    roots = [os.environ.get("CLAUDE_CONFIG_DIR"), os.path.join(os.path.expanduser("~"), ".claude")]
+    for root in roots:
+        if root:
+            hits = glob.glob(os.path.join(glob.escape(root), "projects", "*", session + ".jsonl"))
+            if hits:
+                return hits[0]
+    return ""
+
+
+def save_last_reply(session, text):
+    """Keep the reply Stop just heard, so `/talkback full` doesn't depend on where Claude Code keeps transcripts."""
+    if not valid_session(session) or not isinstance(text, str) or not text:
+        return
+    try:
+        os.makedirs(SESSIONS, exist_ok=True)
+        fd = os.open(session_file(session, ".last"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass
+
+
+def previous_reply(session):
+    if valid_session(session):
+        try:
+            with open(session_file(session, ".last"), encoding="utf-8") as f:
+                text = f.read()
+            if text:
+                return text
+        except OSError:
+            pass
+    return last_reply(find_transcript(session))
 
 
 def last_reply(transcript_path, tail=4 << 20):
@@ -726,6 +769,7 @@ def hook(event):
         if not is_on(session):
             return
         text = data.get("last_assistant_message") or last_reply(data.get("transcript_path", ""))
+        save_last_reply(session, text)
         limit = load_config().get("max_chars", MAX_CHARS)
         text, cut = speakable_parts(text if isinstance(text, str) else "", limit)
         if text:
@@ -749,11 +793,10 @@ def hook(event):
         # next reply. This hook runs before a slash command writes a fresh marker for this turn.
         if valid_session(session):
             remove(session_file(session, ".skipnext"))
-        if is_on(session):
-            try:
-                send({"cmd": "stop", "session": session}, timeout=0.5)
-            except OSError:
-                pass
+        try:
+            send({"cmd": "stop", "session": session}, timeout=0.5)  # a new prompt always ends old speech
+        except OSError:
+            pass
     elif event == "session-start":
         prune_sessions()
         if is_on(session):
@@ -844,7 +887,7 @@ def command(args):
         print("Talkback is off for this session.")
     elif cmd == "full":
         # Re-read the previous reply in full, and don't let the reply to this command cut it off.
-        text = speakable(last_reply(find_transcript(session)), limit=0)
+        text = speakable(previous_reply(session), limit=0)
         if not text:
             print("No previous reply to read.")
             return
@@ -912,7 +955,17 @@ def command(args):
               + (f", helper={'running' if helper_running() else 'stopped'}" if IS_MAC else "") + ".")
 
 
+def utf8_streams():
+    """A Windows console in cp1252 can't print a name like Łukasz: make output UTF-8, never an error."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main():
+    utf8_streams()
     argv = sys.argv[1:]
     # Words saved for /talkback are a user command. They go straight to command() so a
     # file containing hook, _say or _warm cannot reach those internal entry points.
@@ -930,9 +983,9 @@ def main():
             text = f.read()
         os.unlink(argv[2])
         ensure_uv()
-        ensure_helper()
         if ensure_daemon():
             send({"cmd": "say", "session": argv[1] or None, "text": text}, timeout=30)
+        ensure_helper()  # the mic helper isn't needed to speak: don't make the first reply wait for it
     elif argv[:1] == ["speak"]:
         # Pipe-friendly: `some command | talkback.py speak`
         text = speakable(" ".join(argv[1:]) or sys.stdin.read(), limit=0)

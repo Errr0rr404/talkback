@@ -9,6 +9,7 @@ Engines: MLX on Apple silicon (GPU), Kokoro ONNX on the CPU everywhere else (Lin
 On Linux and Windows the daemon also stops speech when a microphone turns on (macOS: talkback-helper).
 Exits after IDLE_EXIT seconds unused.
 """
+import hashlib
 import json
 import os
 import platform
@@ -34,6 +35,28 @@ VERSION = os.environ.get("TALKBACK_VERSION", "dev")
 IDLE_EXIT = 60 * 60
 SAMPLE_RATE = 24000
 ONNX_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+# The release files never change; a download that doesn't match is dropped, not loaded.
+ONNX_SHA256 = {
+    "kokoro-v1.0.onnx": "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5",
+    "voices-v1.0.bin": "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d",
+}
+
+
+def fetch_model(name, dest):
+    """Download one ONNX model file, check its SHA-256, and only then move it into place."""
+    part = dest + ".part"
+    try:
+        urllib.request.urlretrieve(ONNX_URL + name, part)
+        digest = hashlib.sha256()
+        with open(part, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+        if digest.hexdigest() != ONNX_SHA256[name]:
+            raise RuntimeError(f"{name} failed its SHA-256 check; the download was discarded")
+        os.replace(part, dest)
+    finally:
+        if os.path.exists(part):
+            os.unlink(part)
 
 
 def log(msg):
@@ -68,8 +91,7 @@ class OnnxEngine:
             path = os.path.join(models, name)
             if not os.path.exists(path):
                 log(f"downloading {name}")
-                urllib.request.urlretrieve(ONNX_URL + name, path + ".part")
-                os.replace(path + ".part", path)
+                fetch_model(name, path)
         self.kokoro = Kokoro(*(os.path.join(models, n) for n in self.files))
 
     def generate(self, text, voice, speed):
