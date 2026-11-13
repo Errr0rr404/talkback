@@ -417,10 +417,14 @@ def synth(text, voice=None, speed=None):
     interrupts speech already playing nor trips the microphone gate (that gate watches the player).
     """
     cfg = config()
-    if not isinstance(voice, str) or not voice:
+    if voice is None:
         voice = cfg.get("voice", "af_heart")
+    if not isinstance(voice, str) or not re.fullmatch(r"[a-z]{2}_[a-z0-9]{2,24}", voice):
+        raise ValueError("bad voice id")
     if speed is None:
         speed = cfg.get("speed", 1.1)
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not 0.5 <= speed <= 2:
+        raise ValueError("speed must be a number from 0.5 to 2")
     parts = []
     with speak_lock:
         for audio in engine.generate(text, voice, float(speed)):

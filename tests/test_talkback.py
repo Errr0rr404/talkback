@@ -1085,7 +1085,7 @@ class DaemonSynthTest(unittest.TestCase):
 
         ns = load_voiced(("speak", "speak_locked", "stop", "synth", "handle", "SAMPLE_RATE"),
                          current=state, lock=threading.Lock(), speak_lock=threading.Lock(), sf=sf, np=np,
-                         io=io, json=json, make_player=Player, engine=engine, token="tok", last_used=0,
+                         io=io, json=json, re=re, make_player=Player, engine=engine, token="tok", last_used=0,
                          config=lambda: {"voice": "af_heart", "speed": 1.1})
         ns["made"] = made
         return ns, state, made
@@ -1240,6 +1240,25 @@ class DaemonSynthTest(unittest.TestCase):
         self.assertEqual(bytes(conn.sent), b"err too_long\n")
         self.assertEqual(calls, ["x" * 2000])
         self.assertEqual(state["gen"], 0)
+        self.assertEqual(made, [])
+
+    def test_synth_rejects_a_bad_voice_or_speed_before_the_engine_runs(self):
+        calls = []
+
+        class Engine:
+            def generate(self, *args, **kwargs):
+                calls.append(args)
+                raise AssertionError("engine should not run")
+
+        ns, _, made = self.ns(Engine())
+        for extra in ({"voice": "../x"}, {"voice": "af_heart; rm"}, {"voice": 5}, {"speed": 0}, {"speed": 99},
+                      {"speed": "fast"}, {"speed": True}, {"speed": float("nan")}):
+            conn = self.conn({"cmd": "synth", "token": "tok", "text": "hello", **extra})
+            ns["handle"](conn)
+            reply = bytes(conn.sent)
+            self.assertTrue(reply.startswith(b"err engine "), (extra, reply))
+            self.assertEqual(reply.count(b"\n"), 1)
+        self.assertEqual(calls, [])
         self.assertEqual(made, [])
 
     def test_synth_engine_error_is_one_line(self):
