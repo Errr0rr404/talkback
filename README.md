@@ -37,6 +37,8 @@ talkback only reads replies aloud. To speak to Claude:
 
 More (speed, length, auto-Enter, say, setup) in [How it works](docs/how-it-works.md#commands).
 
+The speech service also accepts `synth` (same local token as `say`): it returns a 24 kHz mono WAV and does not interrupt speech already playing. See [How it works](docs/how-it-works.md#pieces).
+
 ## Troubleshooting
 
 - **No sound:** run `/talkback status`. `installing Kokoro` means wait; `stopped` means look at `~/.talkback/voiced.log`.
