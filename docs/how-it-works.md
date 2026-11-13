@@ -8,6 +8,7 @@
   - `SessionStart` warms the engine for sessions where talkback is on.
 - **Speech service** (`engine/voiced.py`): a small Kokoro process on `127.0.0.1` (port and token in `~/.talkback/voiced.json`).
   - It stays loaded between replies and quits after an hour unused.
+  - `synth` returns one mono 16-bit 24 kHz WAV of the text (`ok <nbytes> 24000 wav`, then the bytes) instead of playing it. It does not interrupt speech already playing. Empty text and text over 2000 characters are refused.
   - On Apple silicon it makes about 10 s of speech in 0.6 s.
   - After a plugin update, the next reply replaces a service left over from the older version.
 - **macOS helper** (`helper/main.swift`, built on first use; `talkback-helper-arm64` is a prebuilt copy for Macs without Xcode tools):

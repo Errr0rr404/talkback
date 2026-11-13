@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "talkback",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Hear Claude Code's replies in a natural voice that runs on your machine. Optional: talk back with /voice, or with Hex on macOS.",
   "author": {
     "name": "Zan",

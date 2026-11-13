@@ -1062,6 +1062,226 @@ class DaemonSpeakTest(unittest.TestCase):
         self.assertEqual(rep.call_count, 5)
 
 
+class DaemonSynthTest(unittest.TestCase):
+    """synth returns a WAV and does not interrupt speech already playing."""
+
+    def ns(self, engine):
+        import threading
+        import numpy as np
+        import soundfile as sf
+        state = {"gen": 0, "session": None, "player": None}
+        made = []
+
+        class Player:
+            def __init__(self, path, seconds):
+                self.killed = False
+                made.append(self)
+
+            def wait(self):
+                pass
+
+            def kill(self):
+                self.killed = True
+
+        ns = load_voiced(("speak", "speak_locked", "stop", "synth", "handle", "SAMPLE_RATE"),
+                         current=state, lock=threading.Lock(), speak_lock=threading.Lock(), sf=sf, np=np,
+                         io=io, json=json, re=re, make_player=Player, engine=engine, token="tok", last_used=0,
+                         config=lambda: {"voice": "af_heart", "speed": 1.1})
+        ns["made"] = made
+        return ns, state, made
+
+    def conn(self, req):
+        class Conn:
+            def __init__(self):
+                self.sent = bytearray()
+
+            def makefile(self):
+                return io.StringIO(json.dumps(req) + "\n")
+
+            def sendall(self, data):
+                self.sent += data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        return Conn()
+
+    def wav_reply(self, sent):
+        import wave
+        header, nl, wav = sent.partition(b"\n")
+        self.assertEqual(nl, b"\n", sent)
+        parts = header.split()
+        self.assertEqual(parts[0], b"ok", header)
+        self.assertEqual(parts[2:], [b"24000", b"wav"], header)
+        nbytes = int(parts[1])
+        self.assertEqual(len(wav), nbytes)
+        self.assertEqual(len(sent), len(header) + 1 + nbytes)
+        with wave.open(io.BytesIO(wav), "rb") as parsed:
+            self.assertEqual(parsed.getnchannels(), 1)
+            self.assertEqual(parsed.getframerate(), 24000)
+            self.assertEqual(parsed.getsampwidth(), 2)
+            frames = parsed.getnframes()
+        return frames
+
+    def test_synth_header_matches_wav_bytes(self):
+        import numpy as np
+        seen = {}
+
+        class Engine:
+            def generate(self, text, voice, speed):
+                seen["text"] = text
+                seen["voice"] = voice
+                seen["speed"] = speed
+                yield np.full(240, 0.25, dtype=np.float32)
+                yield np.full(240, -0.25, dtype=np.float32)
+
+        ns, _, made = self.ns(Engine())
+        conn = self.conn({"cmd": "synth", "token": "tok", "text": "hello", "voice": "bf_emma", "speed": 1.4})
+        ns["handle"](conn)
+        frames = self.wav_reply(bytes(conn.sent))
+        self.assertEqual(frames, 480)
+        self.assertEqual(seen, {"text": "hello", "voice": "bf_emma", "speed": 1.4})
+        self.assertEqual(made, [])
+
+    def test_synth_uses_configured_voice_and_speed_when_omitted(self):
+        import numpy as np
+        seen = {}
+
+        class Engine:
+            def generate(self, text, voice, speed):
+                seen["voice"] = voice
+                seen["speed"] = speed
+                yield np.zeros(24, dtype=np.float32)
+
+        ns, _, _ = self.ns(Engine())
+        conn = self.conn({"cmd": "synth", "token": "tok", "text": "hi"})
+        ns["handle"](conn)
+        self.wav_reply(bytes(conn.sent))
+        self.assertEqual(seen, {"voice": "af_heart", "speed": 1.1})
+
+    def test_synth_during_say_does_not_stop_it(self):
+        import threading
+        import numpy as np
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Engine:
+            def generate(self, text, voice, speed):
+                if text == "say-this":
+                    yield np.zeros(240, dtype=np.float32)
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("say was not released")
+                    yield np.zeros(240, dtype=np.float32)
+                else:
+                    yield np.full(120, 0.1, dtype=np.float32)
+
+        ns, state, made = self.ns(Engine())
+        say = threading.Thread(target=ns["speak"], args=("say-this", "s1"))
+        say.start()
+        self.assertTrue(entered.wait(5))
+        deadline = time.time() + 5
+        while not made and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(made), 1)
+        player = made[0]
+        gen = state["gen"]
+        result = {}
+
+        def run_synth():
+            conn = self.conn({"cmd": "synth", "token": "tok", "text": "overlay"})
+            ns["handle"](conn)
+            result["sent"] = bytes(conn.sent)
+
+        synth = threading.Thread(target=run_synth)
+        synth.start()
+        time.sleep(0.2)
+        self.assertFalse(player.killed)
+        self.assertEqual(state["gen"], gen)
+        self.assertIs(state["player"], player)
+        release.set()
+        say.join(5)
+        synth.join(5)
+        self.assertFalse(say.is_alive())
+        self.assertFalse(synth.is_alive())
+        self.assertFalse(player.killed)
+        self.assertFalse(made[1].killed)
+        self.assertEqual(state["gen"], gen)
+        self.assertEqual(len(made), 2)  # both of the say's segments; synth started no player
+        self.assertEqual(self.wav_reply(result["sent"]), 120)
+
+    def test_synth_rejects_empty_and_too_long(self):
+        import numpy as np
+        calls = []
+
+        class Engine:
+            def generate(self, text, voice, speed):
+                calls.append(text)
+                yield np.zeros(8, dtype=np.float32)
+
+        ns, state, made = self.ns(Engine())
+        for text in ("", "   ", None):
+            req = {"cmd": "synth", "token": "tok"}
+            if text is not None:
+                req["text"] = text
+            conn = self.conn(req)
+            ns["handle"](conn)
+            self.assertEqual(bytes(conn.sent), b"err empty\n")
+        self.assertEqual(calls, [])
+        conn = self.conn({"cmd": "synth", "token": "tok", "text": "x" * 2000})
+        ns["handle"](conn)
+        self.wav_reply(bytes(conn.sent))
+        self.assertEqual(calls, ["x" * 2000])
+        conn = self.conn({"cmd": "synth", "token": "tok", "text": "x" * 2001})
+        ns["handle"](conn)
+        self.assertEqual(bytes(conn.sent), b"err too_long\n")
+        self.assertEqual(calls, ["x" * 2000])
+        self.assertEqual(state["gen"], 0)
+        self.assertEqual(made, [])
+
+    def test_synth_rejects_a_bad_voice_or_speed_before_the_engine_runs(self):
+        calls = []
+
+        class Engine:
+            def generate(self, *args, **kwargs):
+                calls.append(args)
+                raise AssertionError("engine should not run")
+
+        ns, _, made = self.ns(Engine())
+        for extra in ({"voice": "../x"}, {"voice": "af_heart; rm"}, {"voice": 5}, {"speed": 0}, {"speed": 99},
+                      {"speed": "fast"}, {"speed": True}, {"speed": float("nan")}):
+            conn = self.conn({"cmd": "synth", "token": "tok", "text": "hello", **extra})
+            ns["handle"](conn)
+            reply = bytes(conn.sent)
+            self.assertTrue(reply.startswith(b"err engine "), (extra, reply))
+            self.assertEqual(reply.count(b"\n"), 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(made, [])
+
+    def test_synth_engine_error_is_one_line(self):
+        class Engine:
+            def generate(self, text, voice, speed):
+                raise RuntimeError("synth failed\nbad")
+
+        ns, _, _ = self.ns(Engine())
+        conn = self.conn({"cmd": "synth", "token": "tok", "text": "hello"})
+        ns["handle"](conn)
+        self.assertEqual(bytes(conn.sent), b"err engine RuntimeError: synth failed bad\n")
+
+    def test_bad_token_is_ignored(self):
+        class Engine:
+            def generate(self, *args, **kwargs):
+                raise AssertionError("engine should not run")
+
+        ns, _, _ = self.ns(Engine())
+        conn = self.conn({"cmd": "synth", "token": "nope", "text": "hello"})
+        ns["handle"](conn)
+        self.assertEqual(bytes(conn.sent), b"")
+
+
 class DaemonStartTest(TalkbackTest):
     def test_ping_clears_start_failed(self):
         open(self.tb.START_FAILED, "w").close()

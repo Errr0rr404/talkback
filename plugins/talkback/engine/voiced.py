@@ -1,15 +1,19 @@
 """Kokoro TTS daemon: keeps the model warm and speaks text it is sent.
 
 Listens on 127.0.0.1 (port and token in ~/.talkback/voiced.json). Requests are one JSON line with the token:
-{"cmd": "say", "text": ..., "session": ...}, {"cmd": "stop", "session": ...}, {"cmd": "ping"} or {"cmd": "quit"}.
+{"cmd": "say", "text": ..., "session": ...}, {"cmd": "stop", "session": ...}, {"cmd": "ping"}, {"cmd": "quit"}
+or {"cmd": "synth", "text": ..., "voice": ..., "speed": ...}.
 A new "say" interrupts whatever is playing; a "stop" without a session stops any speech. "ping" answers
 "pong <engine> <version> <player>" so the plugin can replace a daemon left over from an older version.
+"synth" returns one mono 16-bit 24 kHz WAV (`ok <nbytes> 24000 wav`, then the bytes) and does not interrupt
+speech already playing. Empty text and text over 2000 characters are refused.
 
 Engines: MLX on Apple silicon (GPU), Kokoro ONNX on the CPU everywhere else (Linux, Windows, Intel Macs).
 On Linux and Windows the daemon also stops speech when a microphone turns on (macOS: talkback-helper).
 Exits after IDLE_EXIT seconds unused.
 """
 import hashlib
+import io
 import json
 import os
 import platform
@@ -406,6 +410,32 @@ def speak_locked(text, gen):
                 current["session"] = current["player"] = None
 
 
+def synth(text, voice=None, speed=None):
+    """Return mono 16-bit WAV bytes for `text` on the same generate path as speak_locked.
+
+    Holds speak_lock so only one synthesis runs at a time. Starts no player, so it neither
+    interrupts speech already playing nor trips the microphone gate (that gate watches the player).
+    """
+    cfg = config()
+    if voice is None:
+        voice = cfg.get("voice", "af_heart")
+    if not isinstance(voice, str) or not re.fullmatch(r"[a-z]{2}_[a-z0-9]{2,24}", voice):
+        raise ValueError("bad voice id")
+    if speed is None:
+        speed = cfg.get("speed", 1.1)
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not 0.5 <= speed <= 2:
+        raise ValueError("speed must be a number from 0.5 to 2")
+    parts = []
+    with speak_lock:
+        for audio in engine.generate(text, voice, float(speed)):
+            parts.append(np.array(audio, dtype=np.float32, copy=True).reshape(-1))
+    if not parts:
+        raise RuntimeError("no audio")
+    buf = io.BytesIO()
+    sf.write(buf, np.concatenate(parts), SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
 def handle(conn):
     global last_used
     with conn:
@@ -428,6 +458,24 @@ def handle(conn):
             conn.sendall(b"ok\n")
         elif cmd == "ping":
             conn.sendall(f"pong {engine.name} {VERSION} {player_name()}\n".encode())
+        elif cmd == "synth":
+            text = req.get("text", "")
+            if not isinstance(text, str):
+                conn.sendall(b"err empty\n")
+            elif len(text) > 2000:
+                conn.sendall(b"err too_long\n")
+            elif not text.strip():
+                conn.sendall(b"err empty\n")
+            else:
+                try:
+                    wav = synth(text, req.get("voice"), req.get("speed"))
+                except Exception as exc:  # noqa: BLE001 - a synth failure must not kill the daemon
+                    detail = " ".join(str(exc).split())
+                    reason = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+                    log(f"synth failed: {reason[:200]}")
+                    conn.sendall(f"err engine {reason[:200]}\n".encode())
+                else:
+                    conn.sendall(f"ok {len(wav)} {SAMPLE_RATE} wav\n".encode() + wav)
         elif cmd == "quit":
             stop()
             conn.sendall(b"ok\n")
